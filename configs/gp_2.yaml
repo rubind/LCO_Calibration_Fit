@@ -1,0 +1,115 @@
+# Standalone production configuration for the gp filter.
+# Relative paths are resolved from this configs/ directory.
+schema_version: 1
+selected_filter: gp
+
+inputs:
+  observations:
+    path: ../all_phot_filtered.txt
+    format: whitespace
+    columns:
+      target: star
+      filter: filter
+      image: image
+      airmass: airmass
+      flux: flux
+      flux_uncertainty: flux_unc
+    instrument_regex: '^(?P<instrument>.+?)-\d{8}(?:-|$)'
+    site_prefix_length: 3
+
+  filter_curves:
+    gp:
+      path: ../passband_ingredients/filter_gp.txt
+      wavelength_unit: nm
+      wavelength_convention: vacuum
+      value_semantics: fraction
+      duplicate_policy: error
+      negative_tolerance: 0.001
+
+  ccd:
+    path: ../passband_ingredients/QE.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: percent
+    duplicate_policy: error
+    negative_tolerance: 0.0
+
+  aluminum_squared:
+    path: ../passband_ingredients/aluminum_squared.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: fraction
+    duplicate_policy: error
+    negative_tolerance: 0.0
+
+  atmosphere:
+    path: ../passband_ingredients/kpnoextinct.dat.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: extinction_mag_per_airmass
+    duplicate_policy: error
+    negative_tolerance: 0.0
+    sentinel_values: []
+
+  spectra_directory: ../CALSPEC_spectra
+  target_mapping: ../star_spectra_mapping.txt
+  vega_spectrum: ../CALSPEC_spectra/alpha_lyr_stis_012.fits
+
+selection:
+  snr_min: 10.0
+  require_positive_flux: true
+
+# The broad grid retains low-level out-of-band response and leaves room for
+# every shift allowed by the hard bounds.
+grid:
+  minimum_angstrom: 2700.0
+  maximum_angstrom: 11000.0
+  spacing_angstrom: 2.0
+  response_threshold: 1.0e-3  # Above the measured digitization-noise floor.
+  convergence_tolerance_mag: 0.0005
+
+model:
+  magnitude_system: vega
+  passband_mode: shift_width
+  pivot_wavelength_angstrom: 6250.0
+  warp_scale_angstrom: 1400.0
+  atmosphere_mode: fixed_kpno
+  airmass_round_decimals: null
+
+bounds:
+  shift_abs_max_angstrom: 250.0
+  width_min: 0.7
+  width_max: 1.3
+  warp_abs_max: 2.0
+
+priors:
+  shift_population_mean: {mean: 0.0, sigma: 50.0}
+  shift_population_scale: {scale: 30.0}
+  log_width_population_mean: {mean: 0.0, sigma: 0.05}
+  log_width_population_scale: {scale: 0.03}
+  warp_population_mean: {mean: 0.0, sigma: 0.5}
+  warp_population_scale: {scale: 0.3}
+  zeropoint_population_mean: {mean: 0.0, sigma: 1.0}
+  zeropoint_population_scale: {scale: 0.2}
+  star_correlated_scatter: {scale: 0.03}
+  extra_scatter: {scale: 0.05}
+
+sampler:
+  num_warmup: 2000
+  num_samples: 5000
+  num_chains: 4
+  thinning: 1
+  random_seed: 12345
+  chain_method: parallel
+  progress: true
+  target_accept_prob: 0.95
+  max_tree_depth: 10
+  dense_mass: true
+
+plotting:
+  posterior_draws: 500
+  formats: [png]
+
+output:
+  directory: ../runs
+  run_label: null

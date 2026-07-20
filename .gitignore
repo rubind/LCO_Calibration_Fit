@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+outputs/
+runs/
+*.h5
+.DS_Store
+*~
+.mplconfig/
+.venv/
+down.sh
+up.sh
+tmp.sh
+run_all.py

@@ -1,0 +1,172 @@
+import matplotlib
+import numpy as np
+import pytest
+
+matplotlib.use("Agg")
+
+from passband_fit.diagnostics import (
+    binned_residual_trend,
+    information_criteria,
+    parameter_summary,
+    posterior_matrices,
+    posterior_predictive_draws,
+    posterior_predictive_p_values,
+    residual_metrics,
+)
+from passband_fit.plotting import (
+    _corner_quantile_title,
+    format_quantile_summary,
+    format_zeropoint_conventions,
+    plot_acceptance_fractions,
+    plot_corner,
+    plot_passband,
+    plot_passband_ensemble,
+    plot_residual_comparison,
+    plot_trace,
+)
+
+
+def test_parameter_summary_and_matrices():
+    samples = np.array([[1.0, 5.0], [2.0, 7.0], [3.0, 9.0]])
+    summary = parameter_summary(samples, ["a", "b"], [-3.0, -1.0, -2.0])
+    assert summary.loc["a", "median"] == pytest.approx(2.0)
+    assert summary.loc["a", "maximum_posterior"] == pytest.approx(2.0)
+    covariance, correlation = posterior_matrices(samples, ["a", "b"])
+    assert covariance.shape == (2, 2)
+    assert correlation.loc["a", "b"] == pytest.approx(1.0)
+
+
+def test_residual_metrics_and_information_criteria():
+    residual = np.array([1.0, -1.0, 2.0])
+    result = residual_metrics(residual, [1.0, 2.0, 1.0])
+    assert result["n"] == 3
+    assert result["rms"] == pytest.approx(np.sqrt(2.0))
+    assert result["weighted_rms"] != result["rms"]
+    criteria = information_criteria(-10.0, 3, 100)
+    assert criteria["aic"] == pytest.approx(26.0)
+    assert criteria["bic"] == pytest.approx(3 * np.log(100) + 20)
+
+
+def test_posterior_predictive_helpers_are_seeded_and_dimensioned():
+    means = np.zeros((100, 4))
+    measurement = np.repeat(0.1, 4)
+    extra = np.repeat(0.2, 100)
+    first = posterior_predictive_draws(means, measurement, extra, random_seed=22)
+    second = posterior_predictive_draws(means, measurement, extra, random_seed=22)
+    np.testing.assert_allclose(first, second)
+    assert np.std(first) == pytest.approx(np.hypot(0.1, 0.2), rel=0.15)
+    p_values = posterior_predictive_p_values(np.zeros(4), first, x=np.arange(4.0))
+    assert set(p_values) == {"mean", "rms", "std", "slope"}
+    assert all(0 <= value <= 1 for value in p_values.values())
+
+
+def test_binned_residual_trend():
+    result = binned_residual_trend([0, 1, 2, 3], [0.0, 0.2, 0.4, 0.6], bins=[0, 2, 4])
+    assert result["n"].tolist() == [2, 2]
+    np.testing.assert_allclose(result["mean_residual"], [0.1, 0.5])
+
+
+def test_plotting_primitives_save_files(tmp_path):
+    trace_path = tmp_path / "trace.png"
+    residual_path = tmp_path / "residual.png"
+    passband_path = tmp_path / "passband.png"
+    acceptance_path = tmp_path / "acceptance.png"
+    plot_trace(np.zeros((3, 4, 2)), ["a", "b"], trace_path)
+    plot_residual_comparison(
+        [1, 2], [0.1, -0.1], [1.1, 2.1], [0.05, -0.05], output_path=residual_path
+    )
+    plot_passband(
+        [4000, 5000], [0, 1], [0, 0.9], [0, 0.8], [0, 1.0], output_path=passband_path
+    )
+    plot_acceptance_fractions([0.2, 0.3, 0.4], acceptance_path)
+    for path in (trace_path, residual_path, passband_path, acceptance_path):
+        assert path.exists() and path.stat().st_size > 0
+
+
+def test_corner_titles_scale_precision_with_uncertainty(tmp_path):
+    # These quantiles are exactly 0.0277 +/- 0.0023. Three percent of the
+    # uncertainty is closest to 1e-4, so four decimal places are retained.
+    samples = np.linspace(0.0254, 0.0300, 101)
+    title = _corner_quantile_title("mu_Z", samples)
+    assert "0.0277" in title
+    assert "0.0016" in title
+    assert "-0.0000" not in title
+    assert "+0.0000" not in title
+    output = tmp_path / "corner.png"
+    figure = plot_corner(samples[:, None], ["mu_Z"], output_path=output)
+    assert "0.0277" in figure.axes[0].get_title()
+    assert output.exists() and output.stat().st_size > 0
+
+
+def test_zeropoint_convention_annotation_preserves_additive_offset_sign():
+    samples = np.linspace(0.0254, 0.0300, 101)
+    ab_minus_vega = 0.125
+
+    from_vega = format_zeropoint_conventions(samples, "vega", ab_minus_vega)
+    expected_from_vega = (
+        format_quantile_summary(
+            "mean zeropoint μ_Z (Vega=0)", samples, unit="mag"
+        )
+        + "\n"
+        + format_quantile_summary(
+            "mean zeropoint μ_Z (AB)", samples - ab_minus_vega, unit="mag"
+        )
+    )
+    assert from_vega == expected_from_vega
+
+    from_ab = format_zeropoint_conventions(samples, "AB", ab_minus_vega)
+    expected_from_ab = (
+        format_quantile_summary(
+            "mean zeropoint μ_Z (Vega=0)",
+            samples + ab_minus_vega,
+            unit="mag",
+        )
+        + "\n"
+        + format_quantile_summary(
+            "mean zeropoint μ_Z (AB)", samples, unit="mag"
+        )
+    )
+    assert from_ab == expected_from_ab
+
+
+def test_three_panel_residual_titles_include_filter_and_rms():
+    figure = plot_residual_comparison(
+        [1, 2],
+        [0.1, -0.1],
+        [1.1, 2.1],
+        [0.01, -0.01],
+        intermediate_x=[1.1, 2.1],
+        intermediate_residual=[0.05, -0.05],
+        filter_name="V",
+        panel_annotations=(
+            None,
+            "mean zeropoint μ_Z = 0.0123 mag",
+            "star-offset population dispersion σ_star = 0.0045 mag",
+        ),
+    )
+    assert len(figure.axes) == 3
+    assert all("V —" in axis.get_title() for axis in figure.axes)
+    assert all("RMS =" in axis.get_title() for axis in figure.axes)
+    assert "100.0 mmag" in figure.axes[0].get_title()
+    assert "50.0 mmag" in figure.axes[1].get_title()
+    assert "10.0 mmag" in figure.axes[2].get_title()
+    assert "mean zeropoint μ_Z = 0.0123 mag" in figure.axes[1].get_title()
+    assert "mean zeropoint μ_Z" not in figure.axes[2].get_title()
+    assert "star-offset population dispersion σ_star" not in figure.axes[1].get_title()
+    assert (
+        "star-offset population dispersion σ_star = 0.0045 mag"
+        in figure.axes[2].get_title()
+    )
+
+
+def test_nominal_ensemble_curve_is_drawn_above_instruments():
+    figure = plot_passband_ensemble(
+        [4000, 5000],
+        np.array([[0.1, 0.9], [0.2, 0.8]]),
+        ["camera-a", "camera-b"],
+        nominal=[0.15, 0.85],
+    )
+    lines = figure.axes[0].lines
+    nominal = next(line for line in lines if line.get_label() == "nominal")
+    instruments = [line for line in lines if line.get_label() != "nominal"]
+    assert all(nominal.get_zorder() > line.get_zorder() for line in instruments)

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "passband-fit"
+version = "0.1.0"
+description = "Hierarchical fitting of LCO effective photometric passbands with CALSPEC standards"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23,<2",
+  "scipy>=1.9,<2",
+  "pandas>=1.5,<3",
+  "astropy>=5,<7",
+  "jax>=0.4.29,<0.5",
+  "jaxlib>=0.4.29,<0.5",
+  "numpyro>=0.16,<0.17",
+  "corner>=2.2,<3",
+  "matplotlib>=3.5,<4",
+  "PyYAML>=6,<7",
+  "h5py>=3.7,<4",
+  "tqdm>=4.64,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7,<9"]
+
+[project.scripts]
+passband-fit = "passband_fit.cli:main"
+passband-extend-calspec = "passband_fit.calspec_extension:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: stochastic recovery tests that run MCMC"]

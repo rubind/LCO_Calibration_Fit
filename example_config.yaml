@@ -1,0 +1,120 @@
+# Strict configuration schema. Relative paths are resolved from this file.
+schema_version: 1
+
+# The CLI still requires --filter; its value overrides this convenient example default.
+selected_filter: gp
+
+inputs:
+  observations:
+    path: all_phot_filtered.txt
+    format: whitespace
+    columns:
+      target: star
+      filter: filter
+      image: image
+      airmass: airmass
+      flux: flux
+      flux_uncertainty: flux_unc
+    # Capture everything before the YYYYMMDD component of an LCO image name.
+    instrument_regex: '^(?P<instrument>.+?)-\d{8}(?:-|$)'
+    # LCO site codes are the first three characters: lsc, cpt, coj, elp, tfn.
+    site_prefix_length: 3
+
+  # This example intentionally declares only gp. Add sibling mappings for other filters.
+  filter_curves:
+    gp:
+      path: passband_ingredients/filter_gp.txt
+      wavelength_unit: nm
+      wavelength_convention: vacuum  # Assumed until source metadata establish otherwise.
+      value_semantics: fraction
+      duplicate_policy: error
+      negative_tolerance: 0.001  # Covers the file's sub-0.04% digitization artifacts only.
+
+  ccd:
+    path: passband_ingredients/QE.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: percent
+    duplicate_policy: error
+    negative_tolerance: 0.0
+
+  # This file already contains aluminum reflectivity squared; do not square it again.
+  aluminum_squared:
+    path: passband_ingredients/aluminum_squared.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: fraction
+    duplicate_policy: error
+    negative_tolerance: 0.0
+
+  atmosphere:
+    path: passband_ingredients/kpnoextinct.dat.txt
+    wavelength_unit: angstrom
+    wavelength_convention: vacuum
+    value_semantics: extinction_mag_per_airmass
+    duplicate_policy: error
+    negative_tolerance: 0.0
+    # The two leading values of 10 are boundary sentinels, not measurements.
+    sentinel_values: []
+
+  spectra_directory: CALSPEC_spectra
+  target_mapping: star_spectra_mapping.txt
+  vega_spectrum: CALSPEC_spectra/alpha_lyr_stis_012.fits
+
+selection:
+  snr_min: 10.0
+  require_positive_flux: true
+
+grid:
+  minimum_angstrom: 3200.0
+  maximum_angstrom: 7000.0
+  spacing_angstrom: 2.0
+  response_threshold: 1.0e-6
+  convergence_tolerance_mag: 0.0005
+
+model:
+  magnitude_system: vega
+  passband_mode: shift_only
+  pivot_wavelength_angstrom: 4800.0
+  warp_scale_angstrom: 1200.0
+  atmosphere_mode: fixed_kpno
+  airmass_round_decimals: null  # Exact airmasses; rounding changes the scientific model.
+
+# These are explicit numerical support bounds, separate from the priors.
+bounds:
+  shift_abs_max_angstrom: 250.0
+  width_min: 0.7
+  width_max: 1.3
+  warp_abs_max: 2.0
+
+priors:
+  shift_population_mean: {mean: 0.0, sigma: 50.0}
+  shift_population_scale: {scale: 30.0}
+  log_width_population_mean: {mean: 0.0, sigma: 0.05}
+  log_width_population_scale: {scale: 0.03}
+  warp_population_mean: {mean: 0.0, sigma: 0.5}
+  warp_population_scale: {scale: 0.3}
+  zeropoint_population_mean: {mean: 0.0, sigma: 1.0}
+  zeropoint_population_scale: {scale: 0.2}
+  star_correlated_scatter: {scale: 0.03}
+  extra_scatter: {scale: 0.05}
+
+sampler:
+  num_warmup: 1000
+  num_samples: 5000
+  num_chains: 4
+  thinning: 1
+  random_seed: 12345
+  chain_method: parallel  # NumPyro configures one virtual CPU device per chain.
+  progress: true
+  target_accept_prob: 0.8
+  max_tree_depth: 10
+  dense_mass: false
+
+plotting:
+  posterior_draws: 500
+  formats: [png]
+
+output:
+  directory: runs
+  run_label: null
