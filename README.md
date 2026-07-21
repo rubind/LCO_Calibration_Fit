@@ -132,6 +132,18 @@ PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit plot --run runs/gp/gp-s
 
 An editable install also provides the `passband-fit` command. `validate` performs all loading, conversion, selection, coverage, and grid checks without sampling. NumPyro runs start in a new nonempty-safe directory; legacy emcee/HDF5 runs are not resumable as NumPyro chains. Plot and summarize commands consume persisted artifacts without rerunning inference. Smoke output verifies execution and is never a convergence or scientific-result claim.
 
+To regenerate plots for every completed run without rerunning sampling, use the
+top-level batch script:
+
+```bash
+/opt/anaconda3/bin/python rerun_all_plots.py
+```
+
+The script discovers `runs/*/*/manifest.json`, skips incomplete run directories
+that have no `chain.npz` or legacy `chain.h5`, reports progress and failures, and
+returns a nonzero exit status if any plottable run fails. Use `--dry-run` to list
+what would be processed or `--stop-on-error` to stop at the first failure.
+
 ### Extending a CALSPEC tail with stellar templates
 
 `scripts/extend_calspec.py` creates a new FITS spectrum without modifying the

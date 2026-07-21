@@ -15,6 +15,7 @@ from passband_fit.diagnostics import (
 )
 from passband_fit.plotting import (
     _corner_quantile_title,
+    fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
     plot_acceptance_fractions,
@@ -159,14 +160,50 @@ def test_three_panel_residual_titles_include_filter_and_rms():
     )
 
 
+@pytest.mark.parametrize(
+    ("mode", "label"),
+    (
+        ("shift_only", "shift"),
+        ("shift_width", "shift + width"),
+        ("shift_width_warp", "shift + width + warp"),
+    ),
+)
+def test_fitted_passband_panel_title_names_model(mode, label):
+    title = fitted_passband_panel_title(mode)
+    assert f"Fitted passband ({label}) + zeropoints" in title
+    assert "before star offset" in title
+
+
+def test_grouped_residuals_can_use_distinct_filled_markers():
+    groups = np.array([0, 1, 2])
+    figure = plot_residual_comparison(
+        [1, 2, 3],
+        [0.1, 0.0, -0.1],
+        [1, 2, 3],
+        [0.05, 0.0, -0.05],
+        groups=groups,
+        group_names=("star-a", "star-b", "star-c"),
+        distinct_group_markers=True,
+    )
+    collections = figure.axes[0].collections
+    marker_paths = {
+        tuple(np.round(collection.get_paths()[0].vertices, 6).ravel())
+        for collection in collections
+    }
+    assert len(marker_paths) == 3
+    assert all(collection.get_sizes()[0] == pytest.approx(18.0) for collection in collections)
+
+
 def test_nominal_ensemble_curve_is_drawn_above_instruments():
     figure = plot_passband_ensemble(
         [4000, 5000],
         np.array([[0.1, 0.9], [0.2, 0.8]]),
         ["camera-a", "camera-b"],
         nominal=[0.15, 0.85],
+        title="V passbands — model: shift + width",
     )
     lines = figure.axes[0].lines
     nominal = next(line for line in lines if line.get_label() == "nominal")
     instruments = [line for line in lines if line.get_label() != "nominal"]
     assert all(nominal.get_zorder() > line.get_zorder() for line in instruments)
+    assert figure.axes[0].get_title() == "V passbands — model: shift + width"

@@ -44,8 +44,10 @@ from .io import (
 from .output import build_manifest, write_csv, write_json, write_manifest, write_resolved_config
 from .passband_model import instrument_passband, support_reaches_grid_boundary
 from .plotting import (
+    fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
+    passband_model_label,
     plot_acceptance_fractions,
     plot_corner,
     plot_forest,
@@ -966,7 +968,7 @@ def _write_products(
         intermediate_residual=fitted_residual_without_star,
         panel_titles=(
             "Nominal passband",
-            "Fitted passband + zeropoints, before star offset",
+            fitted_passband_panel_title(prepared.config.model.passband_mode),
             "Full fitted model, after star offset",
         ),
         panel_annotations=(
@@ -974,6 +976,7 @@ def _write_products(
             mean_zeropoint_annotation,
             star_dispersion_annotation,
         ),
+        distinct_group_markers=True,
         filter_name=str(prepared.config.selected_filter),
         output_path=plots / "residuals_by_target.png",
     )
@@ -998,6 +1001,10 @@ def _write_products(
         quantiles[1],
         prepared.selected.instrument_names,
         nominal=prepared.nominal_passband,
+        title=(
+            f"{prepared.config.selected_filter} passbands — model: "
+            f"{passband_model_label(prepared.config.model.passband_mode)}"
+        ),
         output_path=plots / "passbands_all_instruments.png",
     )
     for instrument, name in enumerate(prepared.selected.instrument_names):

@@ -25,8 +25,10 @@ from .io import load_calspec_spectrum, load_vega_spectrum
 from .output import sha256_file, write_json
 from .pipeline import build_posterior, fit_baseline, prepare_fit, run_fit
 from .plotting import (
+    fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
+    passband_model_label,
     plot_acceptance_fractions,
     plot_corner,
     plot_log_probability_trace,
@@ -209,6 +211,7 @@ def _regenerate_plots(run_dir: Path) -> None:
     plot_acceptance_fractions(acceptance, plots / "acceptance.png")
     residuals = pd.read_csv(run_dir / "residuals.csv")
     curves = pd.read_csv(run_dir / "nominal_curves.csv")
+    run_config = load_config(run_dir / "resolved_config.yaml")
     filter_name = str(manifest.get("selected_filter", "unknown filter"))
     mean_zeropoint_annotation = None
     if "mu_Z" in names:
@@ -263,7 +266,7 @@ def _regenerate_plots(run_dir: Path) -> None:
             "intermediate_residual": residual_without_star,
             "panel_titles": (
                 "Nominal passband",
-                "Fitted passband + zeropoints, before star offset",
+                fitted_passband_panel_title(run_config.model.passband_mode),
                 "Full fitted model, after star offset",
             ),
             "panel_annotations": (
@@ -291,6 +294,7 @@ def _regenerate_plots(run_dir: Path) -> None:
         residuals["fitted_residual"],
         groups=target_groups,
         group_names=targets,
+        distinct_group_markers=True,
         filter_name=filter_name,
         output_path=plots / "residuals_by_target.png",
         **target_plot_kwargs,
@@ -301,6 +305,10 @@ def _regenerate_plots(run_dir: Path) -> None:
         passbands["median"],
         passbands["instrument_names"].astype(str),
         nominal=curves["nominal_combined_passband"],
+        title=(
+            f"{filter_name} passbands — model: "
+            f"{passband_model_label(run_config.model.passband_mode)}"
+        ),
         output_path=plots / "passbands_all_instruments.png",
     )
     flattened_path = run_dir / "flattened_samples.npz"

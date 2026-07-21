@@ -64,7 +64,7 @@ selection:
 grid:
   minimum_angstrom: 2700.0
   maximum_angstrom: 11000.0
-  spacing_angstrom: 2.0
+  spacing_angstrom: 1.0
   response_threshold: 1.0e-3  # Above the measured digitization-noise floor.
   convergence_tolerance_mag: 0.0005
 

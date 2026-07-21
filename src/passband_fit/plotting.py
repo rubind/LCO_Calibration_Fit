@@ -9,6 +9,48 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+FILLED_GROUP_MARKERS = (
+    "o",
+    "s",
+    "^",
+    "v",
+    "D",
+    "P",
+    "X",
+    "h",
+    "p",
+    "<",
+    ">",
+    "8",
+    "d",
+    "H",
+)
+
+
+def passband_model_label(passband_mode: str) -> str:
+    """Return a concise, readable label for a configured passband model."""
+
+    labels = {
+        "shift_only": "shift",
+        "shift_width": "shift + width",
+        "shift_width_warp": "shift + width + warp",
+    }
+    try:
+        return labels[passband_mode]
+    except KeyError as exc:
+        raise ValueError(f"unsupported passband mode: {passband_mode!r}") from exc
+
+
+def fitted_passband_panel_title(passband_mode: str) -> str:
+    """Return a readable residual-panel title for a configured passband model."""
+
+    model_label = passband_model_label(passband_mode)
+    return (
+        f"Fitted passband ({model_label}) + zeropoints,\n"
+        "before star offset"
+    )
+
+
 def _finish_figure(
     figure: plt.Figure,
     output_path: Optional[Union[Path, str]],
@@ -81,12 +123,17 @@ def _grouped_scatter(
     residual: np.ndarray,
     groups: Optional[np.ndarray],
     group_names: Optional[Sequence[str]],
+    distinct_group_markers: bool,
 ) -> None:
     if groups is None:
         axis.scatter(x, residual, s=18, alpha=0.75)
         return
     unique = np.unique(groups)
-    for group in unique:
+    if distinct_group_markers and len(unique) > len(FILLED_GROUP_MARKERS):
+        raise ValueError(
+            f"distinct markers support at most {len(FILLED_GROUP_MARKERS)} groups"
+        )
+    for marker_index, group in enumerate(unique):
         selected = groups == group
         label = str(group)
         if group_names is not None:
@@ -94,7 +141,15 @@ def _grouped_scatter(
             if integer < 0 or integer >= len(group_names):
                 raise ValueError("group index is outside group_names")
             label = str(group_names[integer])
-        axis.scatter(x[selected], residual[selected], s=18, alpha=0.75, label=label)
+        marker = FILLED_GROUP_MARKERS[marker_index] if distinct_group_markers else "o"
+        axis.scatter(
+            x[selected],
+            residual[selected],
+            s=18,
+            marker=marker,
+            alpha=0.75,
+            label=label,
+        )
     if len(unique) <= 15:
         axis.legend(fontsize="small", ncol=2)
 
@@ -113,6 +168,7 @@ def plot_residual_comparison(
     panel_titles: Optional[Sequence[str]] = None,
     filter_name: Optional[str] = None,
     panel_annotations: Optional[Sequence[Optional[str]]] = None,
+    distinct_group_markers: bool = False,
 ) -> plt.Figure:
     """Plot two or three stages of observed-minus-model residuals."""
 
@@ -155,11 +211,15 @@ def plot_residual_comparison(
     )
     if len(annotations) != len(panels):
         raise ValueError("panel_annotations must contain one entry per residual panel")
-    annotation_line_count = max(
-        (annotation.count("\n") + 1 for annotation in annotations if annotation),
-        default=0,
-    )
-    figure_height = 4.0 + 0.45 * max(0, annotation_line_count - 1)
+    display_line_counts = []
+    for title, annotation in zip(titles, annotations):
+        line_count = title.count("\n") + 1
+        if filter_name is not None:
+            line_count += 1  # RMS line
+        if annotation:
+            line_count += annotation.count("\n") + 1
+        display_line_counts.append(line_count)
+    figure_height = 4.0 + 0.45 * max(0, max(display_line_counts) - 3)
     figure, axes = plt.subplots(
         1,
         len(panels),
@@ -171,7 +231,14 @@ def plot_residual_comparison(
     for axis, (x_values, residual_values), title, annotation in zip(
         axes, panels, titles, annotations
     ):
-        _grouped_scatter(axis, x_values, residual_values, group_array, group_names)
+        _grouped_scatter(
+            axis,
+            x_values,
+            residual_values,
+            group_array,
+            group_names,
+            distinct_group_markers,
+        )
         axis.axhline(0.0, color="black", linewidth=0.8)
         if filter_name is not None:
             rms_mmag = 1000.0 * np.sqrt(np.mean(residual_values**2))
@@ -223,6 +290,7 @@ def plot_passband_ensemble(
     instrument_names: Sequence[str],
     nominal: Optional[Sequence[float]] = None,
     output_path: Optional[Union[Path, str]] = None,
+    title: Optional[str] = None,
 ) -> plt.Figure:
     """Compare posterior median instrumental passbands on one axis."""
 
@@ -246,7 +314,11 @@ def plot_passband_ensemble(
         )
     for curve, name in zip(curves, instrument_names):
         axis.plot(wave, curve, alpha=0.8, label=str(name), zorder=2)
-    axis.set(xlabel="wavelength (Angstrom)", ylabel="relative throughput")
+    axis.set(
+        xlabel="wavelength (Angstrom)",
+        ylabel="relative throughput",
+        title=title,
+    )
     axis.legend(fontsize="small", ncol=2)
     return _finish_figure(figure, output_path)
 
