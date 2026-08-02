@@ -13,9 +13,11 @@ from passband_fit.config import (
 )
 from passband_fit.io import (
     InputError,
+    load_atmosphere_curves,
     load_calspec_spectrum,
     load_curve,
     load_observation_table,
+    load_site_mapping,
     load_selected_data,
     load_target_mapping,
     load_target_spectra,
@@ -55,6 +57,31 @@ def test_real_observation_table_and_gp_selection():
     assert "lsc1m004-fa03" in selected.instrument_names
     index = selected.instrument_names.index("lsc1m004-fa03")
     assert np.all(np.asarray(selected.sites)[selected.instrument_index == index] == "lsc")
+
+
+def test_site_mapping_selects_the_supplied_unit_airmass_curves():
+    config = load_config(ROOT / "example_config.yaml")
+    mapping = load_site_mapping(ROOT / "site_mapping.txt")
+    assert mapping == {
+        "tfn": "Tenerife-ish",
+        "cpt": "Sutherland",
+        "elp": "McDonald",
+        "coj": "SidingSpring",
+        "lsc": "CTIO",
+    }
+    resolved, curves = load_atmosphere_curves(config, mapping)
+    assert resolved == mapping
+    assert set(curves) == set(mapping.values())
+    for curve in curves.values():
+        assert curve.wavelength_angstrom[0] == pytest.approx(2900.0)
+        assert curve.values[0] == 0.0
+        assert np.all((curve.values >= 0.0) & (curve.values <= 1.0))
+
+
+def test_site_mapping_rejects_an_unmapped_observed_prefix():
+    config = load_config(ROOT / "example_config.yaml")
+    with pytest.raises(InputError, match="lacks observed image prefix"):
+        load_atmosphere_curves(config, ["xxx"])
 
 
 def test_selection_accounting_magnitudes_and_exact_aliases():

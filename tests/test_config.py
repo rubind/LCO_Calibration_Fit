@@ -56,6 +56,20 @@ def test_example_config_loads_and_is_real_rooted():
     assert config.sampler.max_tree_depth == 10
     assert config.sampler.dense_mass is False
     assert config.priors.star_correlated_scatter.scale == pytest.approx(0.03)
+    assert config.model.atmosphere_mode == "site_specific"
+    assert config.inputs.site_mapping == ROOT / "site_mapping.txt"
+    assert set(config.inputs.atmospheres) == {
+        "CTIO",
+        "McDonald",
+        "SidingSpring",
+        "Sutherland",
+        "Tenerife-ish",
+    }
+    assert all(
+        curve.wavelength_unit == "nm"
+        and curve.value_semantics == "fraction"
+        for curve in config.inputs.atmospheres.values()
+    )
 
 
 def test_all_standalone_filter_configs_use_numpyro_sampler_schema():
@@ -81,6 +95,9 @@ def test_all_standalone_filter_configs_use_numpyro_sampler_schema():
         assert config.sampler.num_chains == 4
         assert config.sampler.chain_method == "parallel"
         assert config.priors.star_correlated_scatter.scale == pytest.approx(0.03)
+        assert config.model.atmosphere_mode == "site_specific"
+        assert config.inputs.atmosphere is None
+        assert len(config.inputs.atmospheres) == 5
 
 
 def test_numpyro_sampler_settings_round_trip(tmp_path):
@@ -151,6 +168,13 @@ def test_paths_resolve_relative_to_config_and_cli_filter_wins(tmp_path):
     assert config.selected_filter == "rp"
     assert config.inputs.observations.path == tmp_path / "observations.txt"
     assert config.output.directory == tmp_path / "runs"
+
+
+def test_fixed_passband_mode_is_accepted(tmp_path):
+    raw = minimal_config()
+    raw["model"] = {"passband_mode": "fixed"}
+    config = load_config(write_config(tmp_path, raw))
+    assert config.model.passband_mode == "fixed"
 
 
 @pytest.mark.parametrize(

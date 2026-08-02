@@ -21,6 +21,7 @@ dependencies = [
   "PyYAML>=6,<7",
   "h5py>=3.7,<4",
   "tqdm>=4.64,<5",
+  "daft-pgm>=0.1.4,<0.2",
 ]
 
 [project.optional-dependencies]

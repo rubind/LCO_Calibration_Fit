@@ -106,8 +106,13 @@ def _default_input_paths(config: FitConfig) -> Sequence[Path]:
         config.inputs.vega_spectrum,
         config.inputs.ccd.path,
         config.inputs.aluminum_squared.path,
-        config.inputs.atmosphere.path,
     ]
+    if config.inputs.atmosphere is not None:
+        paths.append(config.inputs.atmosphere.path)
+    else:
+        if config.inputs.site_mapping is not None:
+            paths.append(config.inputs.site_mapping)
+        paths.extend(curve.path for curve in config.inputs.atmospheres.values())
     paths.extend(curve.path for curve in config.inputs.filter_curves.values())
     return paths
 

@@ -108,7 +108,8 @@ def make_mock_problem(
 
     theta = layout.initial_vector(ModelPriors())
     shifts = np.linspace(-18.0, 18.0, n_instruments)
-    _set_family(theta, layout, "delta_lambda", shifts, 18.0)
+    if "delta_lambda" in layout.enabled_families:
+        _set_family(theta, layout, "delta_lambda", shifts, 18.0)
     widths = np.linspace(0.985, 1.015, n_instruments)
     if "eta" in layout.enabled_families:
         _set_family(theta, layout, "eta", np.log(widths), 0.02)

@@ -34,6 +34,7 @@ from .diagnostics import (
 )
 from .hierarchical_model import HierarchicalPosterior, ModelPriors, ParameterLayout
 from .io import (
+    load_atmosphere_curves,
     load_curve,
     load_filter_curve,
     load_selected_data,
@@ -43,10 +44,12 @@ from .io import (
 )
 from .output import build_manifest, write_csv, write_json, write_manifest, write_resolved_config
 from .passband_model import instrument_passband, support_reaches_grid_boundary
+from .population_passband import generate_population_mean_passband_products
 from .plotting import (
     fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
+    passband_ensemble_filename,
     passband_model_label,
     plot_acceptance_fractions,
     plot_corner,
@@ -79,7 +82,11 @@ class PreparedFit:
     aluminum_squared: np.ndarray
     quantum_efficiency: np.ndarray
     nominal_passband: np.ndarray
+    atmosphere_site_names: Tuple[str, ...]
+    instrument_site_names: Tuple[str, ...]
     unit_airmass_transmission: np.ndarray
+    unit_airmass_transmission_by_site: np.ndarray
+    unit_airmass_transmission_by_instrument: np.ndarray
     spectra: np.ndarray
     reference_flux: np.ndarray
     vega_flux: np.ndarray
@@ -103,6 +110,16 @@ class PreparedFit:
             raise ValueError("width exceeds configured hard bound")
         if np.any(np.abs(warps) > bounds.warp_abs_max):
             raise ValueError("warp exceeds configured hard bound")
+        if self.config.model.passband_mode == "fixed":
+            fixed_curve = (
+                self.filter_transmission
+                * self.aluminum_squared
+                * self.quantum_efficiency
+            )
+            return np.broadcast_to(
+                fixed_curve[None, :],
+                (count, len(self.wavelength_angstrom)),
+            ).copy()
         curves = np.empty((count, len(self.wavelength_angstrom)))
         for index in range(count):
             curves[index] = instrument_passband(
@@ -156,7 +173,11 @@ class PreparedFit:
 
 
 def _subset_selected(
-    selected: SelectedData, keep: np.ndarray, excluded: Sequence[str]
+    selected: SelectedData,
+    keep: np.ndarray,
+    excluded: Sequence[str],
+    *,
+    fit_passband_shape: bool = True,
 ) -> SelectedData:
     """Subset rows and rebuild compact target/instrument indices."""
 
@@ -181,7 +202,7 @@ def _subset_selected(
     leverage_warnings = []
     for name in instrument_names:
         row_count = int(np.count_nonzero(row_instruments == name))
-        if distinct_targets[name] < 2:
+        if fit_passband_shape and distinct_targets[name] < 2:
             leverage_warnings.append(
                 f"{name} has only {distinct_targets[name]} distinct target; shape parameters "
                 "are prior/hierarchy dominated"
@@ -223,17 +244,23 @@ def _subset_selected(
     )
 
 
-def _component_arrays(config: FitConfig, wave: np.ndarray) -> Tuple[np.ndarray, ...]:
+def _component_arrays(
+    config: FitConfig,
+    wave: np.ndarray,
+    atmosphere_curves: Mapping[str, object],
+) -> Tuple[np.ndarray, ...]:
     filter_curve = load_filter_curve(config)
     ccd_curve = load_curve(config.inputs.ccd, "CCD QE")
     aluminum_curve = load_curve(config.inputs.aluminum_squared, "aluminum squared")
-    atmosphere_curve = load_curve(config.inputs.atmosphere, "KPNO unit-airmass transmission")
     filter_values = interpolate_curve(filter_curve, wave)
     aluminum = interpolate_curve(aluminum_curve, wave)
     qe = interpolate_curve(ccd_curve, wave)
-    atmosphere = interpolate_curve(atmosphere_curve, wave)
+    atmospheres = {
+        name: interpolate_curve(curve, wave)
+        for name, curve in atmosphere_curves.items()
+    }
     nominal = combine_nominal_components(filter_values, aluminum, qe)
-    return filter_values, aluminum, qe, atmosphere, nominal
+    return filter_values, aluminum, qe, atmospheres, nominal
 
 
 def _effective_coverage_envelope(
@@ -242,15 +269,18 @@ def _effective_coverage_envelope(
     filter_transmission: np.ndarray,
     aluminum_squared: np.ndarray,
     quantum_efficiency: np.ndarray,
-    unit_airmass_transmission: np.ndarray,
-    minimum_airmass: float,
+    least_extincted_atmosphere: np.ndarray,
 ) -> np.ndarray:
     """Union of complete effective responses at transform-bound corners."""
 
-    shifts = (-config.bounds.shift_abs_max_angstrom, config.bounds.shift_abs_max_angstrom)
+    shifts = (
+        (0.0,)
+        if config.model.passband_mode == "fixed"
+        else (-config.bounds.shift_abs_max_angstrom, config.bounds.shift_abs_max_angstrom)
+    )
     widths = (
         (1.0,)
-        if config.model.passband_mode == "shift_only"
+        if config.model.passband_mode in {"fixed", "shift_only"}
         else (config.bounds.width_min, config.bounds.width_max)
     )
     warps = (
@@ -259,8 +289,9 @@ def _effective_coverage_envelope(
         else (0.0,)
     )
     fixed_response = aluminum_squared * quantum_efficiency
-    atmosphere = unit_airmass_transmission**minimum_airmass
-    nominal_effective = filter_transmission * fixed_response * atmosphere
+    nominal_effective = (
+        filter_transmission * fixed_response * least_extincted_atmosphere
+    )
     envelope = nominal_effective / np.max(nominal_effective)
     for shift in shifts:
         for width in widths:
@@ -274,7 +305,7 @@ def _effective_coverage_envelope(
                     warp_parameter=warp,
                     warp_scale_angstrom=config.model.warp_scale_angstrom,
                 )
-                effective = curve * fixed_response * atmosphere
+                effective = curve * fixed_response * least_extincted_atmosphere
                 envelope = np.maximum(envelope, effective / np.max(effective))
     if support_reaches_grid_boundary(
         envelope, relative_threshold=config.grid.response_threshold
@@ -287,24 +318,24 @@ def _effective_coverage_envelope(
 
 def _validate_component_coverage(
     config: FitConfig,
+    atmosphere_curves: Mapping[str, object],
 ) -> None:
     """Allow zero fill only beyond physically negligible atmosphere/QE edges."""
 
     threshold = config.grid.response_threshold
     component_edge_threshold = max(threshold, 1.0e-3)
-    atmosphere_curve = load_curve(
-        config.inputs.atmosphere, "KPNO unit-airmass transmission"
-    )
-    if atmosphere_curve.values[0] > component_edge_threshold:
-        raise ValueError(
-            "atmosphere blue-edge coverage failure; zero fill is allowed only "
-            "after the unit-airmass transmission is negligible. "
-            f"Transmission is {atmosphere_curve.values[0]:.6g} at the first "
-            f"tabulated wavelength {atmosphere_curve.wavelength_angstrom[0]:.1f} "
-            f"Angstrom, above the component-edge threshold "
-            f"{component_edge_threshold:g}. Extend the "
-            "physical atmosphere model farther blueward."
-        )
+    for site_name, atmosphere_curve in atmosphere_curves.items():
+        if atmosphere_curve.values[0] > component_edge_threshold:
+            raise ValueError(
+                f"atmosphere blue-edge coverage failure for site {site_name}; "
+                "zero fill is allowed only after the unit-airmass transmission "
+                "is negligible. "
+                f"Transmission is {atmosphere_curve.values[0]:.6g} at the first "
+                f"tabulated wavelength "
+                f"{atmosphere_curve.wavelength_angstrom[0]:.1f} Angstrom, above "
+                f"the component-edge threshold {component_edge_threshold:g}. "
+                "Extend the physical atmosphere model farther blueward."
+            )
 
     ccd_curve = load_curve(config.inputs.ccd, "CCD QE")
     endpoint_limit = component_edge_threshold * float(np.max(ccd_curve.values))
@@ -324,6 +355,8 @@ def _convergence_check(
     coarse_wave: np.ndarray,
     coarse_nominal: np.ndarray,
     valid_targets: Sequence[str],
+    atmosphere_curves: Mapping[str, object],
+    site_names: Sequence[str],
 ) -> float:
     """Compare nominal magnitudes on the configured and half-step grids."""
 
@@ -333,60 +366,65 @@ def _convergence_check(
         config.grid.maximum_angstrom + half_step / 2,
         half_step,
     )
-    _, _, _, fine_atmosphere, fine_nominal = _component_arrays(config, fine_wave)
-    _, _, _, coarse_atmosphere, _ = _component_arrays(config, coarse_wave)
+    _, _, _, fine_atmospheres, fine_nominal = _component_arrays(
+        config, fine_wave, atmosphere_curves
+    )
+    _, _, _, coarse_atmospheres, _ = _component_arrays(
+        config, coarse_wave, atmosphere_curves
+    )
     x_value = 1.3
-    fine_passband = fine_nominal * fine_atmosphere**x_value
-    coarse_passband = coarse_nominal * coarse_atmosphere**x_value
     fine_weights = trapezoid_weights(fine_wave)
     coarse_weights = trapezoid_weights(coarse_wave)
-    if config.model.magnitude_system == "vega":
-        fine_reference = interpolate_spectrum(
-            vega,
-            fine_wave,
-            passband=fine_passband,
-            relative_threshold=config.grid.response_threshold,
-        )
-        coarse_reference = interpolate_spectrum(
-            vega,
-            coarse_wave,
-            passband=coarse_passband,
-            relative_threshold=config.grid.response_threshold,
-        )
-    else:
-        fine_reference = coarse_reference = None
     deltas = []
-    for name in valid_targets:
-        spectrum = target_spectra[name]
-        fine_source = interpolate_spectrum(
-            spectrum,
-            fine_wave,
-            passband=fine_passband,
-            relative_threshold=config.grid.response_threshold,
-        )
-        coarse_source = interpolate_spectrum(
-            spectrum,
-            coarse_wave,
-            passband=coarse_passband,
-            relative_threshold=config.grid.response_threshold,
-        )
-        fine_mag = synthetic_magnitude(
-            fine_wave,
-            fine_source,
-            fine_passband,
-            magnitude_system=config.model.magnitude_system,
-            vega_flux_lambda=fine_reference,
-            weights=fine_weights,
-        )
-        coarse_mag = synthetic_magnitude(
-            coarse_wave,
-            coarse_source,
-            coarse_passband,
-            magnitude_system=config.model.magnitude_system,
-            vega_flux_lambda=coarse_reference,
-            weights=coarse_weights,
-        )
-        deltas.append(abs(fine_mag - coarse_mag))
+    for site_name in site_names:
+        fine_passband = fine_nominal * fine_atmospheres[site_name] ** x_value
+        coarse_passband = coarse_nominal * coarse_atmospheres[site_name] ** x_value
+        if config.model.magnitude_system == "vega":
+            fine_reference = interpolate_spectrum(
+                vega,
+                fine_wave,
+                passband=fine_passband,
+                relative_threshold=config.grid.response_threshold,
+            )
+            coarse_reference = interpolate_spectrum(
+                vega,
+                coarse_wave,
+                passband=coarse_passband,
+                relative_threshold=config.grid.response_threshold,
+            )
+        else:
+            fine_reference = coarse_reference = None
+        for name in valid_targets:
+            spectrum = target_spectra[name]
+            fine_source = interpolate_spectrum(
+                spectrum,
+                fine_wave,
+                passband=fine_passband,
+                relative_threshold=config.grid.response_threshold,
+            )
+            coarse_source = interpolate_spectrum(
+                spectrum,
+                coarse_wave,
+                passband=coarse_passband,
+                relative_threshold=config.grid.response_threshold,
+            )
+            fine_mag = synthetic_magnitude(
+                fine_wave,
+                fine_source,
+                fine_passband,
+                magnitude_system=config.model.magnitude_system,
+                vega_flux_lambda=fine_reference,
+                weights=fine_weights,
+            )
+            coarse_mag = synthetic_magnitude(
+                coarse_wave,
+                coarse_source,
+                coarse_passband,
+                magnitude_system=config.model.magnitude_system,
+                vega_flux_lambda=coarse_reference,
+                weights=coarse_weights,
+            )
+            deltas.append(abs(fine_mag - coarse_mag))
     maximum = float(max(deltas, default=0.0))
     if maximum > config.grid.convergence_tolerance_mag:
         raise ValueError(
@@ -400,21 +438,37 @@ def prepare_fit(config: FitConfig) -> PreparedFit:
     """Load all real inputs and fail if any reference spectrum lacks coverage."""
 
     initial = load_selected_data(config)
+    prefix_to_site, atmosphere_curves = load_atmosphere_curves(
+        config, initial.sites
+    )
+    observation_site_names = tuple(
+        prefix_to_site[str(prefix).lower()] for prefix in initial.sites
+    )
+    atmosphere_site_names = tuple(dict.fromkeys(observation_site_names))
     wave = np.arange(
         config.grid.minimum_angstrom,
         config.grid.maximum_angstrom + config.grid.spacing_angstrom / 2,
         config.grid.spacing_angstrom,
     )
-    filter_values, aluminum, qe, atmosphere, nominal = _component_arrays(config, wave)
-    _validate_component_coverage(config)
+    filter_values, aluminum, qe, atmospheres, nominal = _component_arrays(
+        config, wave, atmosphere_curves
+    )
+    _validate_component_coverage(config, atmosphere_curves)
+    atmosphere_by_observation = np.asarray(
+        [
+            atmospheres[site_name] ** float(airmass)
+            for site_name, airmass in zip(observation_site_names, initial.airmass)
+        ],
+        dtype=np.float64,
+    )
+    least_extincted_atmosphere = np.max(atmosphere_by_observation, axis=0)
     coverage_envelope = _effective_coverage_envelope(
         config,
         wave,
         filter_values,
         aluminum,
         qe,
-        atmosphere,
-        float(np.min(initial.airmass)),
+        least_extincted_atmosphere,
     )
     target_spectra = load_target_spectra(config, initial.target_names)
     vega = load_vega_spectrum(config)
@@ -445,7 +499,33 @@ def prepare_fit(config: FitConfig) -> PreparedFit:
     valid_targets = list(initial.target_names)
     excluded: Tuple[str, ...] = ()
     keep = np.ones(len(initial.row_id), dtype=bool)
-    selected = _subset_selected(initial, keep, excluded)
+    selected = _subset_selected(
+        initial,
+        keep,
+        excluded,
+        fit_passband_shape=config.model.passband_mode != "fixed",
+    )
+    instrument_site_names = []
+    for instrument_index in range(len(selected.instrument_names)):
+        rows = selected.instrument_index == instrument_index
+        names = tuple(
+            dict.fromkeys(np.asarray(observation_site_names, dtype=object)[rows])
+        )
+        if len(names) != 1:
+            raise ValueError(
+                f"instrument {selected.instrument_names[instrument_index]} maps "
+                f"to multiple atmosphere sites: {', '.join(names)}"
+            )
+        instrument_site_names.append(str(names[0]))
+    instrument_site_names_tuple = tuple(instrument_site_names)
+    atmosphere_by_instrument = np.asarray(
+        [atmospheres[name] for name in instrument_site_names_tuple],
+        dtype=np.float64,
+    )
+    # Retain one representative curve for backward-compatible summaries. The
+    # reported population zeropoint conversion averages the per-instrument
+    # conversions themselves, and the likelihood uses each observation's site.
+    representative_atmosphere = np.mean(atmosphere_by_instrument, axis=0)
     spectra = np.asarray(
         [
             interpolate_spectrum(
@@ -469,7 +549,14 @@ def prepare_fit(config: FitConfig) -> PreparedFit:
         else ab_reference_flux_lambda(wave)
     )
     convergence = _convergence_check(
-        config, target_spectra, vega, wave, nominal, selected.target_names
+        config,
+        target_spectra,
+        vega,
+        wave,
+        nominal,
+        selected.target_names,
+        atmosphere_curves,
+        atmosphere_site_names,
     )
     return PreparedFit(
         config=config,
@@ -480,11 +567,18 @@ def prepare_fit(config: FitConfig) -> PreparedFit:
         aluminum_squared=aluminum,
         quantum_efficiency=qe,
         nominal_passband=nominal,
-        unit_airmass_transmission=atmosphere,
+        atmosphere_site_names=atmosphere_site_names,
+        instrument_site_names=instrument_site_names_tuple,
+        unit_airmass_transmission=representative_atmosphere,
+        unit_airmass_transmission_by_site=np.asarray(
+            [atmospheres[name] for name in atmosphere_site_names],
+            dtype=np.float64,
+        ),
+        unit_airmass_transmission_by_instrument=atmosphere_by_instrument,
         spectra=spectra,
         reference_flux=reference,
         vega_flux=vega_flux,
-        atmosphere_by_observation=atmosphere[None, :] ** selected.airmass[:, None],
+        atmosphere_by_observation=atmosphere_by_observation,
         coverage_excluded_targets=excluded,
         grid_convergence_max_delta_mag=convergence,
     )
@@ -674,11 +768,12 @@ def posterior_boundary_diagnostics(
             ),
         }
 
-    symmetric(
-        "delta_lambda_angstrom",
-        np.asarray([draw["delta_lambda"] for draw in physical]),
-        config.bounds.shift_abs_max_angstrom,
-    )
+    if "delta_lambda" in layout.enabled_families:
+        symmetric(
+            "delta_lambda_angstrom",
+            np.asarray([draw["delta_lambda"] for draw in physical]),
+            config.bounds.shift_abs_max_angstrom,
+        )
     if "eta" in layout.enabled_families:
         widths = np.asarray([draw["width"] for draw in physical])
         width_span = config.bounds.width_max - config.bounds.width_min
@@ -821,12 +916,19 @@ def _write_products(
         prepared.selected.observed_magnitude - fitted_prediction_without_star
     )
     mu_z_index, _, _ = layout.family_indices("Z")
-    ab_minus_vega = ab_magnitude(
-        prepared.wavelength_angstrom,
-        prepared.vega_flux,
-        prepared.nominal_passband * prepared.unit_airmass_transmission,
-        weights=prepared.weights,
+    ab_minus_vega_by_instrument = np.asarray(
+        [
+            ab_magnitude(
+                prepared.wavelength_angstrom,
+                prepared.vega_flux,
+                prepared.nominal_passband
+                * prepared.unit_airmass_transmission_by_instrument[index],
+                weights=prepared.weights,
+            )
+            for index in range(len(prepared.selected.instrument_names))
+        ]
     )
+    ab_minus_vega = float(np.mean(ab_minus_vega_by_instrument))
     mean_zeropoint_annotation = format_zeropoint_conventions(
         flat[:, mu_z_index],
         prepared.config.model.magnitude_system,
@@ -845,7 +947,14 @@ def _write_products(
         {
             "configured_magnitude_system": prepared.config.model.magnitude_system,
             "ab_minus_vega_magnitude": ab_minus_vega,
-            "conversion_passband": "nominal combined passband at unit airmass",
+            "ab_minus_vega_magnitude_by_instrument": {
+                name: float(ab_minus_vega_by_instrument[index])
+                for index, name in enumerate(prepared.selected.instrument_names)
+            },
+            "conversion_passband": (
+                "equally instrument-weighted mean of nominal site-specific "
+                "unit-airmass AB-minus-Vega conversions"
+            ),
             "zeropoint_definition": "fitted additive offset; internal magnitude bookkeeping excluded",
         },
     )
@@ -890,19 +999,21 @@ def _write_products(
         }
     )
     write_csv(run_dir / "residuals.csv", table)
-    write_csv(
-        run_dir / "nominal_curves.csv",
-        pd.DataFrame(
-            {
-                "wavelength_angstrom": prepared.wavelength_angstrom,
-                "filter_transmission": prepared.filter_transmission,
-                "aluminum_squared": prepared.aluminum_squared,
-                "quantum_efficiency": prepared.quantum_efficiency,
-                "unit_airmass_transmission": prepared.unit_airmass_transmission,
-                "nominal_combined_passband": prepared.nominal_passband,
-            }
-        ),
-    )
+    nominal_curve_columns = {
+        "wavelength_angstrom": prepared.wavelength_angstrom,
+        "filter_transmission": prepared.filter_transmission,
+        "aluminum_squared": prepared.aluminum_squared,
+        "quantum_efficiency": prepared.quantum_efficiency,
+        # Retained for compatibility with summary scripts; this is the
+        # equally instrument-weighted representative atmosphere.
+        "unit_airmass_transmission": prepared.unit_airmass_transmission,
+        "nominal_combined_passband": prepared.nominal_passband,
+    }
+    for site_index, site_name in enumerate(prepared.atmosphere_site_names):
+        nominal_curve_columns[
+            f"unit_airmass_transmission_{site_name}"
+        ] = prepared.unit_airmass_transmission_by_site[site_index]
+    write_csv(run_dir / "nominal_curves.csv", pd.DataFrame(nominal_curve_columns))
 
     draw_count = min(prepared.config.plotting.posterior_draws, len(flat))
     draw_indices = np.linspace(0, len(flat) - 1, draw_count, dtype=int)
@@ -930,14 +1041,20 @@ def _write_products(
         q84=quantiles[2],
         instrument_names=np.asarray(prepared.selected.instrument_names, dtype="U"),
     )
-    least_extincted_atmosphere = prepared.unit_airmass_transmission ** float(
-        np.min(prepared.selected.airmass)
+    least_extincted_atmosphere = np.empty_like(
+        prepared.unit_airmass_transmission_by_instrument
     )
+    for instrument_index in range(len(prepared.selected.instrument_names)):
+        rows = prepared.selected.instrument_index == instrument_index
+        least_extincted_atmosphere[instrument_index] = (
+            prepared.unit_airmass_transmission_by_instrument[instrument_index]
+            ** float(np.min(prepared.selected.airmass[rows]))
+        )
     boundary_diagnostics = posterior_boundary_diagnostics(
         flat[draw_indices],
         layout,
         prepared.config,
-        passband_draws * least_extincted_atmosphere[None, None, :],
+        passband_draws * least_extincted_atmosphere[None, :, :],
     )
     write_json(run_dir / "boundary_diagnostics.json", boundary_diagnostics)
 
@@ -1005,8 +1122,13 @@ def _write_products(
             f"{prepared.config.selected_filter} passbands — model: "
             f"{passband_model_label(prepared.config.model.passband_mode)}"
         ),
-        output_path=plots / "passbands_all_instruments.png",
+        output_path=plots
+        / passband_ensemble_filename(
+            str(prepared.config.selected_filter),
+            prepared.config.model.passband_mode,
+        ),
     )
+    generate_population_mean_passband_products(run_dir)
     for instrument, name in enumerate(prepared.selected.instrument_names):
         safe_name = _safe_label(name)
         plot_passband(
@@ -1017,15 +1139,17 @@ def _write_products(
             quantiles[2, instrument],
             effective_curves={
                 "median at X=1": quantiles[1, instrument]
-                * prepared.unit_airmass_transmission,
+                * prepared.unit_airmass_transmission_by_instrument[instrument],
                 "median at X=2": quantiles[1, instrument]
-                * prepared.unit_airmass_transmission**2,
+                * prepared.unit_airmass_transmission_by_instrument[instrument] ** 2,
             },
             title=name,
             output_path=plots / f"passband_{safe_name}.png",
         )
 
-    family_keys = [("delta_lambda", "mu_delta_lambda", "tau_delta_lambda")]
+    family_keys = []
+    if "delta_lambda" in layout.enabled_families:
+        family_keys.append(("delta_lambda", "mu_delta_lambda", "tau_delta_lambda"))
     if "eta" in layout.enabled_families:
         family_keys.append(("width", "mu_eta", "tau_eta"))
     if "a" in layout.enabled_families:
@@ -1210,8 +1334,14 @@ def _manifest_input_paths(prepared: PreparedFit) -> Sequence[Path]:
         config.inputs.filter_curves[str(config.selected_filter)].path,
         config.inputs.ccd.path,
         config.inputs.aluminum_squared.path,
-        config.inputs.atmosphere.path,
     ]
+    if config.inputs.atmosphere is not None:
+        paths.append(config.inputs.atmosphere.path)
+    else:
+        if config.inputs.site_mapping is None:
+            raise ValueError("site-specific atmosphere configuration lacks site_mapping")
+        paths.append(config.inputs.site_mapping)
+        paths.extend(curve.path for curve in config.inputs.atmospheres.values())
     for target in prepared.selected.target_names:
         path = Path(mapping[target])
         if not path.is_absolute():
@@ -1271,6 +1401,22 @@ def run_fit(
             "instruments": {
                 index: name
                 for index, name in enumerate(prepared.selected.instrument_names)
+            },
+            "instrument_atmosphere_sites": {
+                name: prepared.instrument_site_names[index]
+                for index, name in enumerate(prepared.selected.instrument_names)
+            },
+            "image_prefix_atmosphere_sites": {
+                prefix: site_name
+                for prefix, site_name in sorted(
+                    {
+                        str(prefix): prepared.instrument_site_names[instrument_index]
+                        for prefix, instrument_index in zip(
+                            prepared.selected.sites,
+                            prepared.selected.instrument_index,
+                        )
+                    }.items()
+                )
             },
         },
     )

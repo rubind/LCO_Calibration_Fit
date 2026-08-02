@@ -42,14 +42,27 @@ inputs:
     duplicate_policy: error
     negative_tolerance: 0.0
 
-  atmosphere:
-    path: ../passband_ingredients/kpnoextinct.dat.txt
-    wavelength_unit: angstrom
-    wavelength_convention: vacuum
-    value_semantics: extinction_mag_per_airmass
-    duplicate_policy: error
-    negative_tolerance: 0.0
-    sentinel_values: []
+  site_mapping: ../site_mapping.txt
+  atmospheres:
+    CTIO: &site_atmosphere
+      path: ../passband_ingredients/mean_atmospheric_transmission_CTIO.ipac
+      wavelength_unit: nm
+      wavelength_convention: vacuum
+      value_semantics: fraction
+      duplicate_policy: error
+      negative_tolerance: 0.0
+    McDonald:
+      <<: *site_atmosphere
+      path: ../passband_ingredients/mean_atmospheric_transmission_McDonald.ipac
+    SidingSpring:
+      <<: *site_atmosphere
+      path: ../passband_ingredients/mean_atmospheric_transmission_SidingSpring.ipac
+    Sutherland:
+      <<: *site_atmosphere
+      path: ../passband_ingredients/mean_atmospheric_transmission_Sutherland.ipac
+    Tenerife-ish:
+      <<: *site_atmosphere
+      path: ../passband_ingredients/mean_atmospheric_transmission_Tenerife-ish.ipac
 
   spectra_directory: ../CALSPEC_spectra
   target_mapping: ../star_spectra_mapping.txt
@@ -73,7 +86,7 @@ model:
   passband_mode: shift_width
   pivot_wavelength_angstrom: 6250.0
   warp_scale_angstrom: 1400.0
-  atmosphere_mode: fixed_kpno
+  atmosphere_mode: site_specific
   airmass_round_decimals: null
 
 bounds:

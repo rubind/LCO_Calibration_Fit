@@ -345,6 +345,90 @@ def load_curve(config: CurveConfig, name: str = "curve") -> SpectralCurve:
     return SpectralCurve(wave, values, name)
 
 
+def load_site_mapping(path: PathLike) -> Dict[str, str]:
+    """Load an exact image-prefix to observatory-name mapping.
+
+    The plain-text format has one whitespace-separated ``prefix site_name``
+    pair per line. Blank lines and lines beginning with ``#`` are ignored.
+    Site names may contain spaces, although the supplied mapping uses compact
+    names matching the atmosphere configuration keys.
+    """
+
+    mapping_path = Path(path)
+    if not mapping_path.is_file():
+        raise InputError(f"site mapping does not exist: {mapping_path}")
+    result: Dict[str, str] = {}
+    try:
+        with mapping_path.open("r", encoding="utf-8") as handle:
+            for line_number, original in enumerate(handle, start=1):
+                line = original.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                fields = line.split(None, 1)
+                if len(fields) != 2 or not fields[0] or not fields[1].strip():
+                    raise InputError(
+                        f"invalid site mapping at {mapping_path}:{line_number}; "
+                        "expected 'prefix site_name'"
+                    )
+                prefix, site_name = fields[0].lower(), fields[1].strip()
+                if prefix in result:
+                    raise InputError(
+                        f"duplicate site prefix {prefix!r} in {mapping_path}"
+                    )
+                result[prefix] = site_name
+    except (OSError, UnicodeError) as exc:
+        raise InputError(f"could not read site mapping {mapping_path}: {exc}") from exc
+    if not result:
+        raise InputError(f"site mapping is empty: {mapping_path}")
+    return result
+
+
+def load_atmosphere_curves(
+    config: FitConfig,
+    required_prefixes: Sequence[str] = (),
+) -> Tuple[Dict[str, str], Dict[str, SpectralCurve]]:
+    """Load configured unit-airmass curves and resolve observation prefixes.
+
+    Returns ``(prefix_to_site_name, curves_by_site_name)``. Legacy
+    ``fixed_kpno`` configurations are represented by the synthetic site name
+    ``fixed`` so old persisted runs remain readable.
+    """
+
+    if config.model.atmosphere_mode == "fixed_kpno":
+        if config.inputs.atmosphere is None:  # Protected by config validation.
+            raise InputError("fixed_kpno configuration has no atmosphere curve")
+        curve = load_curve(
+            config.inputs.atmosphere, "fixed unit-airmass atmosphere"
+        )
+        return (
+            {str(prefix).lower(): "fixed" for prefix in required_prefixes},
+            {"fixed": curve},
+        )
+
+    if config.inputs.site_mapping is None:  # Protected by config validation.
+        raise InputError("site-specific configuration has no site mapping")
+    prefix_to_site = load_site_mapping(config.inputs.site_mapping)
+    required = tuple(dict.fromkeys(str(prefix).lower() for prefix in required_prefixes))
+    missing_prefixes = [prefix for prefix in required if prefix not in prefix_to_site]
+    if missing_prefixes:
+        raise InputError(
+            "site mapping lacks observed image prefix(es): "
+            + ", ".join(missing_prefixes)
+        )
+    mapped_sites = set(prefix_to_site.values())
+    missing_curves = sorted(mapped_sites - set(config.inputs.atmospheres))
+    if missing_curves:
+        raise InputError(
+            "no atmosphere curve configured for mapped site(s): "
+            + ", ".join(missing_curves)
+        )
+    curves = {
+        site_name: load_curve(curve_config, f"{site_name} unit-airmass atmosphere")
+        for site_name, curve_config in config.inputs.atmospheres.items()
+    }
+    return prefix_to_site, curves
+
+
 def load_filter_curve(config: FitConfig, selected_filter: Optional[str] = None) -> SpectralCurve:
     """Load the configured curve for one exact filter label."""
 

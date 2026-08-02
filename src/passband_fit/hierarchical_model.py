@@ -16,7 +16,7 @@ from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
 
-VALID_MODES = ("shift_only", "shift_width", "shift_width_warp")
+VALID_MODES = ("fixed", "shift_only", "shift_width", "shift_width_warp")
 Array = np.ndarray
 SyntheticMagnitudeEvaluator = Callable[[Mapping[str, object]], Array]
 
@@ -166,7 +166,9 @@ class ParameterLayout:
 
     @property
     def enabled_families(self) -> Tuple[str, ...]:
-        families = ["delta_lambda"]
+        families = []
+        if self.mode != "fixed":
+            families.append("delta_lambda")
         if self.mode in ("shift_width", "shift_width_warp"):
             families.append("eta")
         if self.mode == "shift_width_warp":
@@ -256,7 +258,10 @@ class ParameterLayout:
         log_sigma_extra = float(vector[-1])
         result["log_sigma_extra"] = log_sigma_extra
         result["sigma_extra"] = _safe_exp(log_sigma_extra, "sigma_extra")
-        result["delta_lambda"] = np.asarray(result["delta_lambda"])
+        if "delta_lambda" in result:
+            result["delta_lambda"] = np.asarray(result["delta_lambda"])
+        else:
+            result["delta_lambda"] = np.zeros(self.n_instruments)
         if "eta" in result:
             eta = np.asarray(result["eta"])
             if np.any(eta > 700.0):

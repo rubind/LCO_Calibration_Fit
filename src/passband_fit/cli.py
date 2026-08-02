@@ -24,10 +24,12 @@ from .curves import interpolate_spectrum, trapezoid_weights
 from .io import load_calspec_spectrum, load_vega_spectrum
 from .output import sha256_file, write_json
 from .pipeline import build_posterior, fit_baseline, prepare_fit, run_fit
+from .population_passband import generate_population_mean_passband_products
 from .plotting import (
     fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
+    passband_ensemble_filename,
     passband_model_label,
     plot_acceptance_fractions,
     plot_corner,
@@ -101,7 +103,12 @@ def _saved_ab_minus_vega(run_dir: Path, curves: pd.DataFrame) -> tuple[str, floa
         {
             "configured_magnitude_system": config.model.magnitude_system,
             "ab_minus_vega_magnitude": ab_minus_vega,
-            "conversion_passband": "nominal combined passband at unit airmass",
+            "conversion_passband": (
+                "nominal combined passband with the representative site "
+                "atmosphere at unit airmass"
+                if config.model.atmosphere_mode == "site_specific"
+                else "nominal combined passband at unit airmass"
+            ),
             "zeropoint_definition": "fitted additive offset; internal magnitude bookkeeping excluded",
         },
     )
@@ -213,6 +220,7 @@ def _regenerate_plots(run_dir: Path) -> None:
     curves = pd.read_csv(run_dir / "nominal_curves.csv")
     run_config = load_config(run_dir / "resolved_config.yaml")
     filter_name = str(manifest.get("selected_filter", "unknown filter"))
+    generate_population_mean_passband_products(run_dir)
     mean_zeropoint_annotation = None
     if "mu_Z" in names:
         mu_z_samples = chain[:, :, names.index("mu_Z")].reshape(-1)
@@ -309,8 +317,12 @@ def _regenerate_plots(run_dir: Path) -> None:
             f"{filter_name} passbands — model: "
             f"{passband_model_label(run_config.model.passband_mode)}"
         ),
-        output_path=plots / "passbands_all_instruments.png",
+        output_path=plots
+        / passband_ensemble_filename(filter_name, run_config.model.passband_mode),
     )
+    legacy_passband_plot = plots / "passbands_all_instruments.png"
+    if legacy_passband_plot.is_file():
+        legacy_passband_plot.unlink()
     flattened_path = run_dir / "flattened_samples.npz"
     if flattened_path.is_file() and names:
         flattened = np.load(flattened_path)

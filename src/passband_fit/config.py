@@ -53,7 +53,9 @@ class InputsConfig:
     filter_curves: Mapping[str, CurveConfig]
     ccd: CurveConfig
     aluminum_squared: CurveConfig
-    atmosphere: CurveConfig
+    atmosphere: Optional[CurveConfig]
+    atmospheres: Mapping[str, CurveConfig]
+    site_mapping: Optional[Path]
     spectra_directory: Path
     target_mapping: Path
     vega_spectrum: Path
@@ -283,10 +285,29 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
     base = config_path.parent
 
     inputs_raw = _mapping(raw["inputs"], "inputs")
-    input_keys = ["observations", "filter_curves", "ccd", "aluminum_squared", "atmosphere",
-                  "spectra_directory", "target_mapping", "vega_spectrum"]
+    input_keys = [
+        "observations",
+        "filter_curves",
+        "ccd",
+        "aluminum_squared",
+        "atmosphere",
+        "atmospheres",
+        "site_mapping",
+        "spectra_directory",
+        "target_mapping",
+        "vega_spectrum",
+    ]
     _reject_unknown(inputs_raw, input_keys, "inputs")
-    missing = [key for key in input_keys if key not in inputs_raw]
+    required_input_keys = [
+        "observations",
+        "filter_curves",
+        "ccd",
+        "aluminum_squared",
+        "spectra_directory",
+        "target_mapping",
+        "vega_spectrum",
+    ]
+    missing = [key for key in required_input_keys if key not in inputs_raw]
     if missing:
         raise ConfigError(f"missing required input key(s): {', '.join(missing)}")
     filters_raw = _mapping(inputs_raw["filter_curves"], "inputs.filter_curves")
@@ -294,12 +315,27 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         raise ConfigError("inputs.filter_curves must not be empty")
     filter_curves = {str(key): _curve(value, base, f"inputs.filter_curves.{key}")
                      for key, value in filters_raw.items()}
+    atmospheres_raw = _mapping(inputs_raw.get("atmospheres", {}), "inputs.atmospheres")
+    atmospheres = {
+        str(key): _curve(value, base, f"inputs.atmospheres.{key}")
+        for key, value in atmospheres_raw.items()
+    }
     inputs = InputsConfig(
         observations=_observations(inputs_raw["observations"], base),
         filter_curves=filter_curves,
         ccd=_curve(inputs_raw["ccd"], base, "inputs.ccd"),
         aluminum_squared=_curve(inputs_raw["aluminum_squared"], base, "inputs.aluminum_squared"),
-        atmosphere=_curve(inputs_raw["atmosphere"], base, "inputs.atmosphere"),
+        atmosphere=(
+            _curve(inputs_raw["atmosphere"], base, "inputs.atmosphere")
+            if "atmosphere" in inputs_raw
+            else None
+        ),
+        atmospheres=atmospheres,
+        site_mapping=(
+            _path(inputs_raw["site_mapping"], base, "inputs.site_mapping")
+            if "site_mapping" in inputs_raw
+            else None
+        ),
         spectra_directory=_path(inputs_raw["spectra_directory"], base, "inputs.spectra_directory"),
         target_mapping=_path(inputs_raw["target_mapping"], base, "inputs.target_mapping"),
         vega_spectrum=_path(inputs_raw["vega_spectrum"], base, "inputs.vega_spectrum"),
@@ -336,14 +372,43 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
     model = ModelConfig(**model_raw)
     if model.magnitude_system not in {"vega", "ab"}:
         raise ConfigError("model.magnitude_system must be vega or ab")
-    if model.passband_mode not in {"shift_only", "shift_width", "shift_width_warp"}:
+    if model.passband_mode not in {
+        "fixed",
+        "shift_only",
+        "shift_width",
+        "shift_width_warp",
+    }:
         raise ConfigError("unsupported model.passband_mode")
     if not math.isfinite(model.pivot_wavelength_angstrom) or model.pivot_wavelength_angstrom <= 0:
         raise ConfigError("model.pivot_wavelength_angstrom must be positive and finite")
     if not math.isfinite(model.warp_scale_angstrom) or model.warp_scale_angstrom <= 0:
         raise ConfigError("model.warp_scale_angstrom must be positive and finite")
-    if model.atmosphere_mode != "fixed_kpno":
-        raise ConfigError("only model.atmosphere_mode=fixed_kpno is implemented")
+    if model.atmosphere_mode not in {"fixed_kpno", "site_specific"}:
+        raise ConfigError(
+            "model.atmosphere_mode must be fixed_kpno or site_specific"
+        )
+    if model.atmosphere_mode == "fixed_kpno":
+        if inputs.atmosphere is None:
+            raise ConfigError(
+                "model.atmosphere_mode=fixed_kpno requires inputs.atmosphere"
+            )
+        if inputs.atmospheres or inputs.site_mapping is not None:
+            raise ConfigError(
+                "fixed_kpno uses inputs.atmosphere, not inputs.atmospheres/site_mapping"
+            )
+    else:
+        if inputs.atmosphere is not None:
+            raise ConfigError(
+                "site_specific uses inputs.atmospheres, not inputs.atmosphere"
+            )
+        if not inputs.atmospheres:
+            raise ConfigError(
+                "model.atmosphere_mode=site_specific requires inputs.atmospheres"
+            )
+        if inputs.site_mapping is None:
+            raise ConfigError(
+                "model.atmosphere_mode=site_specific requires inputs.site_mapping"
+            )
     if model.airmass_round_decimals is not None:
         raise ConfigError("airmass rounding is not implemented; use null for exact airmasses")
 

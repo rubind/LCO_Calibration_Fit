@@ -15,9 +15,11 @@ from passband_fit.diagnostics import (
 )
 from passband_fit.plotting import (
     _corner_quantile_title,
+    corner_parameter_label,
     fitted_passband_panel_title,
     format_quantile_summary,
     format_zeropoint_conventions,
+    passband_ensemble_filename,
     plot_acceptance_fractions,
     plot_corner,
     plot_passband,
@@ -35,6 +37,25 @@ def test_parameter_summary_and_matrices():
     covariance, correlation = posterior_matrices(samples, ["a", "b"])
     assert covariance.shape == (2, 2)
     assert correlation.loc["a", "b"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("filter_name", "mode", "expected"),
+    [
+        ("B", "fixed", "passbands_all_instruments_B_fixed.png"),
+        ("B", "shift_only", "passbands_all_instruments_B_shift_only.png"),
+        ("rp", "shift_width", "passbands_all_instruments_rp_shift_width.png"),
+        (
+            "z s",
+            "shift_width_warp",
+            "passbands_all_instruments_z-s_shift_width_warp.png",
+        ),
+    ],
+)
+def test_passband_ensemble_filename_includes_filter_and_model(
+    filter_name, mode, expected
+):
+    assert passband_ensemble_filename(filter_name, mode) == expected
 
 
 def test_residual_metrics_and_information_criteria():
@@ -96,7 +117,32 @@ def test_corner_titles_scale_precision_with_uncertainty(tmp_path):
     output = tmp_path / "corner.png"
     figure = plot_corner(samples[:, None], ["mu_Z"], output_path=output)
     assert "0.0277" in figure.axes[0].get_title()
+    assert figure.axes[0].get_xlabel() == (
+        "mu_Z\npopulation mean zeropoint [mag]"
+    )
     assert output.exists() and output.stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    ("name", "description"),
+    [
+        ("mu_delta_lambda", "population mean shift [Å]"),
+        ("log_tau_Z", "ln(zeropoint Σ / mag)"),
+        (
+            "z_eta[lsc1m004-fa03]",
+            "standardized instrument ln-width deviation",
+        ),
+        ("log_sigma_star", "ln(star-residual Σ / mag)"),
+    ],
+)
+def test_corner_parameter_labels_preserve_name_and_explain_meaning(
+    name, description
+):
+    assert corner_parameter_label(name) == f"{name}\n{description}"
+
+
+def test_corner_parameter_label_leaves_unknown_name_unchanged():
+    assert corner_parameter_label("custom_parameter") == "custom_parameter"
 
 
 def test_zeropoint_convention_annotation_preserves_additive_offset_sign():
@@ -163,6 +209,7 @@ def test_three_panel_residual_titles_include_filter_and_rms():
 @pytest.mark.parametrize(
     ("mode", "label"),
     (
+        ("fixed", "fixed (no passband modification)"),
         ("shift_only", "shift"),
         ("shift_width", "shift + width"),
         ("shift_width_warp", "shift + width + warp"),
@@ -170,6 +217,9 @@ def test_three_panel_residual_titles_include_filter_and_rms():
 )
 def test_fitted_passband_panel_title_names_model(mode, label):
     title = fitted_passband_panel_title(mode)
+    if mode == "fixed":
+        assert title == "Fixed nominal passband + zeropoints,\nbefore star offset"
+        return
     assert f"Fitted passband ({label}) + zeropoints" in title
     assert "before star offset" in title
 

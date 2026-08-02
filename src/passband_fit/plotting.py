@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Mapping, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from .passband_model import instrument_passband
 
 
 FILLED_GROUP_MARKERS = (
@@ -31,6 +34,7 @@ def passband_model_label(passband_mode: str) -> str:
     """Return a concise, readable label for a configured passband model."""
 
     labels = {
+        "fixed": "fixed (no passband modification)",
         "shift_only": "shift",
         "shift_width": "shift + width",
         "shift_width_warp": "shift + width + warp",
@@ -41,14 +45,69 @@ def passband_model_label(passband_mode: str) -> str:
         raise ValueError(f"unsupported passband mode: {passband_mode!r}") from exc
 
 
+def passband_ensemble_filename(filter_name: str, passband_mode: str) -> str:
+    """Return the filter- and model-specific ensemble-passband PNG name."""
+
+    passband_model_label(passband_mode)  # Validate the canonical mode.
+    safe_filter = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(filter_name)).strip(".-")
+    if not safe_filter:
+        raise ValueError("filter name contains no safe filename characters")
+    return f"passbands_all_instruments_{safe_filter}_{passband_mode}.png"
+
+
+def population_passband_filename(filter_name: str, passband_mode: str) -> str:
+    """Return the filter- and model-specific population-passband PNG name."""
+
+    passband_model_label(passband_mode)
+    safe_filter = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(filter_name)).strip(".-")
+    if not safe_filter:
+        raise ValueError("filter name contains no safe filename characters")
+    return f"population_mean_passband_{safe_filter}_{passband_mode}.png"
+
+
 def fitted_passband_panel_title(passband_mode: str) -> str:
     """Return a readable residual-panel title for a configured passband model."""
 
+    if passband_mode == "fixed":
+        return "Fixed nominal passband + zeropoints,\nbefore star offset"
     model_label = passband_model_label(passband_mode)
     return (
         f"Fitted passband ({model_label}) + zeropoints,\n"
         "before star offset"
     )
+
+
+def corner_parameter_label(parameter_name: str) -> str:
+    """Add a concise physical interpretation while preserving the exact name."""
+
+    descriptions = {
+        "mu_delta_lambda": "population mean shift [Å]",
+        "log_tau_delta_lambda": "ln(shift Σ / Å)",
+        "mu_eta": "population mean ln(width scale)",
+        "log_tau_eta": "ln(ln-width Σ)",
+        "mu_a": "population mean warp",
+        "log_tau_a": "ln(warp Σ)",
+        "mu_Z": "population mean zeropoint [mag]",
+        "log_tau_Z": "ln(zeropoint Σ / mag)",
+        "log_sigma_star": "ln(star-residual Σ / mag)",
+        "log_sigma_extra": "ln(point-scatter Σ / mag)",
+    }
+    name = str(parameter_name)
+    description = descriptions.get(name)
+    if description is None:
+        standardized = re.fullmatch(
+            r"z_(delta_lambda|eta|a|Z)\[(.+)\]",
+            name,
+        )
+        if standardized is not None:
+            family_descriptions = {
+                "delta_lambda": "standardized instrument shift deviation",
+                "eta": "standardized instrument ln-width deviation",
+                "a": "standardized instrument warp deviation",
+                "Z": "standardized instrument zeropoint deviation",
+            }
+            description = family_descriptions[standardized.group(1)]
+    return name if description is None else f"{name}\n{description}"
 
 
 def _finish_figure(
@@ -284,6 +343,208 @@ def plot_passband(
     return _finish_figure(figure, output_path)
 
 
+def population_mean_passband_quantiles(
+    wavelength_angstrom: Sequence[float],
+    filter_transmission: Sequence[float],
+    aluminum_squared: Sequence[float],
+    quantum_efficiency: Sequence[float],
+    samples: np.ndarray,
+    parameter_names: Sequence[str],
+    *,
+    passband_mode: str,
+    pivot_wavelength_angstrom: float,
+    warp_scale_angstrom: float,
+    maximum_draws: int,
+) -> np.ndarray:
+    """Return pointwise 16/50/84% curves using population-mean parameters only.
+
+    Each atmosphere-free curve contains the transformed filter, fixed
+    aluminum-squared reflectivity, and fixed CCD QE. Every draw is divided by
+    its own peak, removing the grey normalization that is degenerate with the
+    additive zeropoint. Population dispersions and instrument deviations are
+    deliberately ignored.
+    """
+
+    passband_model_label(passband_mode)
+    wave = np.asarray(wavelength_angstrom, dtype=np.float64)
+    components = [
+        np.asarray(value, dtype=np.float64)
+        for value in (
+            filter_transmission,
+            aluminum_squared,
+            quantum_efficiency,
+        )
+    ]
+    if wave.ndim != 1 or len(wave) < 2:
+        raise ValueError("wavelength must be a vector with at least two entries")
+    if (
+        not np.all(np.isfinite(wave))
+        or not np.all(np.diff(wave) > 0.0)
+        or any(value.shape != wave.shape for value in components)
+        or any(not np.all(np.isfinite(value)) for value in components)
+        or any(np.any(value < 0.0) for value in components)
+    ):
+        raise ValueError("wavelength and passband components are invalid")
+    posterior = np.asarray(samples, dtype=np.float64)
+    if posterior.ndim == 3:
+        posterior = posterior.reshape(-1, posterior.shape[-1])
+    if (
+        posterior.ndim != 2
+        or posterior.shape[1] != len(parameter_names)
+        or not np.all(np.isfinite(posterior))
+    ):
+        raise ValueError("samples must match the finite sampled-parameter matrix")
+    if maximum_draws <= 0:
+        raise ValueError("maximum_draws must be positive")
+
+    required = []
+    if passband_mode != "fixed":
+        required.append("mu_delta_lambda")
+    if passband_mode in {"shift_width", "shift_width_warp"}:
+        required.append("mu_eta")
+    if passband_mode == "shift_width_warp":
+        required.append("mu_a")
+    missing = [name for name in required if name not in parameter_names]
+    if missing:
+        raise ValueError(
+            "samples lack population-mean parameter(s): " + ", ".join(missing)
+        )
+
+    fixed_response = components[1] * components[2]
+
+    def normalized_curve(shift: float, width: float, warp: float) -> np.ndarray:
+        if passband_mode == "fixed":
+            curve = components[0] * fixed_response
+        else:
+            curve = instrument_passband(
+                wave,
+                components[0],
+                pivot_wavelength_angstrom=pivot_wavelength_angstrom,
+                delta_wavelength_angstrom=shift,
+                width_scale=width,
+                warp_parameter=warp,
+                warp_scale_angstrom=warp_scale_angstrom,
+            )
+            curve = curve * fixed_response
+        peak = float(np.max(curve))
+        if not np.isfinite(peak) or peak <= 0.0:
+            raise ValueError("population passband has a nonpositive peak")
+        return curve / peak
+
+    if passband_mode == "fixed":
+        curve = normalized_curve(0.0, 1.0, 0.0)
+        return np.stack((curve, curve, curve))
+
+    lookup = {name: parameter_names.index(name) for name in required}
+    indices = np.linspace(
+        0,
+        len(posterior) - 1,
+        min(maximum_draws, len(posterior)),
+        dtype=np.int64,
+    )
+    curves = np.empty((len(indices), len(wave)), dtype=np.float64)
+    for output_index, sample_index in enumerate(indices):
+        draw = posterior[sample_index]
+        shift = float(draw[lookup["mu_delta_lambda"]])
+        width = (
+            float(np.exp(draw[lookup["mu_eta"]]))
+            if "mu_eta" in lookup
+            else 1.0
+        )
+        warp = float(draw[lookup["mu_a"]]) if "mu_a" in lookup else 0.0
+        curves[output_index] = normalized_curve(shift, width, warp)
+    return np.percentile(curves, [16.0, 50.0, 84.0], axis=0)
+
+
+def plot_population_mean_passband(
+    wavelength_angstrom: Sequence[float],
+    nominal: Sequence[float],
+    quantiles: np.ndarray,
+    *,
+    title: str,
+    output_path: Optional[Union[Path, str]] = None,
+    response_threshold: float = 1.0e-3,
+) -> plt.Figure:
+    """Plot the normalized population-mean passband and its 68% posterior band."""
+
+    wave = np.asarray(wavelength_angstrom, dtype=np.float64)
+    nominal_curve = np.asarray(nominal, dtype=np.float64)
+    credible = np.asarray(quantiles, dtype=np.float64)
+    if (
+        wave.ndim != 1
+        or nominal_curve.shape != wave.shape
+        or credible.shape != (3, len(wave))
+        or not np.all(np.isfinite(nominal_curve))
+        or not np.all(np.isfinite(credible))
+        or np.any(nominal_curve < 0.0)
+        or np.any(credible < 0.0)
+        or np.any(credible[0] > credible[1])
+        or np.any(credible[1] > credible[2])
+    ):
+        raise ValueError("population-passband plot arrays are invalid")
+    if not np.isfinite(response_threshold) or not 0.0 < response_threshold < 1.0:
+        raise ValueError("response_threshold must lie between zero and one")
+    nominal_peak = float(np.max(nominal_curve))
+    if nominal_peak <= 0.0:
+        raise ValueError("nominal passband has a nonpositive peak")
+    normalized_nominal = nominal_curve / nominal_peak
+
+    figure, axis = plt.subplots(figsize=(9, 5))
+    axis.plot(
+        wave,
+        normalized_nominal,
+        linestyle="--",
+        color="black",
+        linewidth=1.5,
+        label="nominal",
+        zorder=3,
+    )
+    axis.fill_between(
+        wave,
+        credible[0],
+        credible[2],
+        color="tab:blue",
+        alpha=0.28,
+        label="population-mean 68% interval",
+        zorder=1,
+    )
+    axis.plot(
+        wave,
+        credible[1],
+        color="tab:blue",
+        linewidth=1.6,
+        label="population-mean posterior median",
+        zorder=2,
+    )
+    support = np.maximum(normalized_nominal, credible[2]) >= response_threshold
+    if np.any(support):
+        selected = np.flatnonzero(support)
+        padding = max(5, int(np.ceil(0.04 * (selected[-1] - selected[0] + 1))))
+        lower_index = max(0, int(selected[0]) - padding)
+        upper_index = min(len(wave) - 1, int(selected[-1]) + padding)
+        axis.set_xlim(wave[lower_index], wave[upper_index])
+    axis.set_ylim(-0.02, 1.05)
+    axis.set(
+        xlabel="vacuum wavelength (Å)",
+        ylabel="relative atmosphere-free throughput (unit peak)",
+        title=title,
+    )
+    axis.grid(color="0.90", linewidth=0.6)
+    axis.legend()
+    axis.text(
+        0.01,
+        0.015,
+        "Posterior population means only; population dispersions and "
+        "instrument offsets excluded.",
+        transform=axis.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize="small",
+        color="0.25",
+    )
+    return _finish_figure(figure, output_path)
+
+
 def plot_passband_ensemble(
     wavelength_angstrom: Sequence[float],
     median_curves: np.ndarray,
@@ -382,7 +643,8 @@ def plot_corner(
     indices = np.arange(values.shape[1]) if subset is None else np.asarray(subset, dtype=int)
     if indices.ndim != 1 or len(indices) == 0 or np.any(indices < 0) or np.any(indices >= values.shape[1]):
         raise ValueError("subset contains invalid parameter indices")
-    labels = [parameter_names[index] for index in indices]
+    names = [parameter_names[index] for index in indices]
+    labels = [corner_parameter_label(name) for name in names]
     selected_truths = None
     if truths is not None:
         truth_values = np.asarray(truths, dtype=np.float64)
@@ -391,8 +653,8 @@ def plot_corner(
         selected_truths = truth_values[indices]
     selected_values = values[:, indices]
     titles = [
-        _corner_quantile_title(label, selected_values[:, column])
-        for column, label in enumerate(labels)
+        _corner_quantile_title(name, selected_values[:, column])
+        for column, name in enumerate(names)
     ]
     figure = corner.corner(
         selected_values,
@@ -465,20 +727,18 @@ def format_zeropoint_conventions(
 ) -> str:
     """Format the additive mean offset in Vega-zero and AB conventions."""
 
-    samples = np.asarray(mu_z_samples, dtype=np.float64)
-    if samples.ndim != 1 or len(samples) == 0 or not np.all(np.isfinite(samples)):
-        raise ValueError("mu_z_samples must be a nonempty finite vector")
-    if not np.isfinite(ab_minus_vega_magnitude):
-        raise ValueError("AB-minus-Vega magnitude must be finite")
-    system = configured_system.strip().lower()
-    if system == "vega":
-        vega_samples = samples
-        ab_samples = samples - ab_minus_vega_magnitude
-    elif system == "ab":
-        ab_samples = samples
-        vega_samples = samples + ab_minus_vega_magnitude
-    else:
-        raise ValueError("configured_system must be 'vega' or 'ab'")
+    vega_samples = convert_zeropoint_samples(
+        mu_z_samples,
+        configured_system,
+        "vega",
+        ab_minus_vega_magnitude,
+    )
+    ab_samples = convert_zeropoint_samples(
+        mu_z_samples,
+        configured_system,
+        "ab",
+        ab_minus_vega_magnitude,
+    )
     vega_text = format_quantile_summary(
         "mean zeropoint μ_Z (Vega=0)", vega_samples, unit="mag"
     )
@@ -486,3 +746,29 @@ def format_zeropoint_conventions(
         "mean zeropoint μ_Z (AB)", ab_samples, unit="mag"
     )
     return f"{vega_text}\n{ab_text}"
+
+
+def convert_zeropoint_samples(
+    mu_z_samples: Sequence[float],
+    configured_system: str,
+    desired_system: str,
+    ab_minus_vega_magnitude: float,
+) -> np.ndarray:
+    """Convert additive zeropoint samples between Vega-zero and AB conventions."""
+
+    samples = np.asarray(mu_z_samples, dtype=np.float64)
+    if samples.ndim != 1 or len(samples) == 0 or not np.all(np.isfinite(samples)):
+        raise ValueError("mu_z_samples must be a nonempty finite vector")
+    if not np.isfinite(ab_minus_vega_magnitude):
+        raise ValueError("AB-minus-Vega magnitude must be finite")
+    source = configured_system.strip().lower()
+    destination = desired_system.strip().lower()
+    if source not in {"vega", "ab"}:
+        raise ValueError("configured_system must be 'vega' or 'ab'")
+    if destination not in {"vega", "ab"}:
+        raise ValueError("desired_system must be 'vega' or 'ab'")
+    if source == destination:
+        return samples.copy()
+    if source == "vega":
+        return samples - ab_minus_vega_magnitude
+    return samples + ab_minus_vega_magnitude

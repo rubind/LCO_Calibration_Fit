@@ -13,12 +13,21 @@ from passband_fit.hierarchical_model import (
 
 @pytest.mark.parametrize(
     "mode,n_families",
-    [("shift_only", 2), ("shift_width", 3), ("shift_width_warp", 4)],
+    [
+        ("fixed", 1),
+        ("shift_only", 2),
+        ("shift_width", 3),
+        ("shift_width_warp", 4),
+    ],
 )
 def test_layout_dimension_and_stable_names(mode, n_families):
     layout = ParameterLayout(mode, 3, ("a", "b", "c"))
     assert layout.ndim == n_families * 5 + 1
-    assert layout.parameter_names[0:2] == ("mu_delta_lambda", "log_tau_delta_lambda")
+    expected_first_family = "Z" if mode == "fixed" else "delta_lambda"
+    assert layout.parameter_names[0:2] == (
+        f"mu_{expected_first_family}",
+        f"log_tau_{expected_first_family}",
+    )
     assert layout.parameter_names[-1] == "log_sigma_extra"
     assert len(layout.parameter_names) == len(set(layout.parameter_names))
 
@@ -42,6 +51,29 @@ def test_noncentered_transform_and_disabled_parameters():
     np.testing.assert_allclose(parameters["width"], 1.0)
     np.testing.assert_allclose(parameters["warp"], 0.0)
     assert parameters["sigma_extra"] == pytest.approx(0.03)
+
+
+def test_fixed_mode_has_only_zeropoint_hierarchy_and_scatter_parameters():
+    layout = ParameterLayout(
+        "fixed",
+        2,
+        ("one", "two"),
+        n_targets=1,
+        target_names=("star",),
+    )
+    assert layout.enabled_families == ("Z",)
+    assert layout.parameter_names == (
+        "mu_Z",
+        "log_tau_Z",
+        "z_Z[one]",
+        "z_Z[two]",
+        "log_sigma_star",
+        "log_sigma_extra",
+    )
+    parameters = layout.unpack(layout.initial_vector())
+    np.testing.assert_array_equal(parameters["delta_lambda"], [0.0, 0.0])
+    np.testing.assert_array_equal(parameters["width"], [1.0, 1.0])
+    np.testing.assert_array_equal(parameters["warp"], [0.0, 0.0])
 
 
 def test_width_derived_vector_reports_eta_and_physical_width():

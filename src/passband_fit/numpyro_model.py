@@ -86,6 +86,8 @@ def _unpack_theta_jax(
         values[family] = mu + tau * z
         values[f"mu_{family}"] = mu
         values[f"tau_{family}"] = tau
+    if "delta_lambda" not in values:
+        values["delta_lambda"] = jnp.zeros(layout.n_instruments, dtype=jnp.float64)
     if "eta" not in values:
         values["eta"] = jnp.zeros(layout.n_instruments, dtype=jnp.float64)
     if "a" not in values:
@@ -156,15 +158,21 @@ def build_potential_fn(
         widths = parameters["width"]
         warps = parameters["a"]
 
-        instrument_curves = instrument_passbands(
-            wave,
-            filter_transmission,
-            pivot,
-            shifts,
-            widths,
-            warps,
-            warp_scale,
-        )
+        if layout.mode == "fixed":
+            instrument_curves = jnp.broadcast_to(
+                filter_transmission[None, :],
+                (layout.n_instruments, filter_transmission.size),
+            )
+        else:
+            instrument_curves = instrument_passbands(
+                wave,
+                filter_transmission,
+                pivot,
+                shifts,
+                widths,
+                warps,
+                warp_scale,
+            )
         instrument_curves = instrument_curves * fixed_instrument_response[None, :]
         effective = instrument_curves[instrument_index] * atmosphere
         source_flux = spectra[target_index]

@@ -27,7 +27,7 @@ where:
 
 The filters, mirrors, and CCDs are nominally the same across the systems, but small system-to-system passband differences are expected. These differences should be modeled hierarchically.
 
-For the first implementation, use one fixed tabulated KPNO atmospheric transmission curve. Evaluate the atmosphere separately at the airmass of each observation. Design the code so that site-specific atmosphere files can be added later without changing the model architecture.
+Use a fixed tabulated unit-airmass transmission curve for each observing site. Resolve the site from the image prefix through `site_mapping.txt`, then evaluate that site's atmosphere separately at the airmass of each observation. The atmospheric curves are fixed physical inputs rather than fitted nuisance parameters.
 
 Fit only one filter per run. The command-line interface should require the user to specify the filter.
 
@@ -129,7 +129,7 @@ The nominal passband files may contain tiny, uncommon negative values caused by 
 
 ## Atmospheric transmission
 
-Assume the supplied atmospheric curve represents transmission at unit airmass:
+Assume each supplied site atmospheric curve represents transmission at unit airmass:
 
 [
 T_{\rm atm}(\lambda,X)
@@ -146,7 +146,7 @@ For numerical stability, values should be bounded to a physically meaningful ran
 
 Document this assumption clearly.
 
-The architecture should permit a later extension in which each site maps to a different atmosphere file.
+Every observed image prefix must map to exactly one configured site atmosphere; missing or inconsistent mappings are hard input errors.
 
 ## Photon-counting synthetic photometry
 
@@ -1001,7 +1001,7 @@ model:
   common_extra_scatter: true
   star_offsets: true
   robust_likelihood: false
-  atmosphere_mode: fixed_kpno
+  atmosphere_mode: site_specific
 ```
 
 Example selection section:
@@ -1031,11 +1031,11 @@ Explicitly state the first-version assumptions:
 
 * observations are conditionally independent given per-star offsets;
 * one filter is fitted per run;
-* one fixed KPNO atmosphere is used;
+* one fixed unit-airmass transmission curve is selected for each observing site;
 * atmospheric transmission scales as (T_1^X);
 * one zero-mean, grey per-star offset hierarchy per filter;
 * no night-level calibration terms;
-* no site-dependent atmospheric parameters;
+* no fitted site-dependent atmospheric parameters;
 * no robust likelihood;
 * one common extra-scatter parameter per filter;
 * direct numerical integration is performed during likelihood evaluation;
@@ -1043,7 +1043,7 @@ Explicitly state the first-version assumptions:
 
 Also document likely future extensions:
 
-* site-specific atmospheric curves;
+* time- or night-dependent atmospheric curves;
 * night-level zeropoints;
 * correlated repeated observations;
 * instrument-dependent extra scatter;
@@ -1113,7 +1113,7 @@ T_{\rm atm}(\lambda,1)=10^{-0.4 k(\lambda)}.
 \]
 
 Then apply (T_{\rm atm}(\lambda,X)=T_{\rm atm}(\lambda,1)^X). The supplied
-atmospheric table must reach negligible transmission at its blue endpoint, and
+site atmospheric table must reach negligible transmission at its blue endpoint, and
 the CCD QE must reach negligible response at its red endpoint, before zero fill
 is allowed. Grid and spectral coverage use the complete transformed-filter ×
 fixed-aluminum² × fixed-QE × atmosphere response, rather than requiring each
@@ -1273,7 +1273,8 @@ The initial audit on 2026-07-15 found Python 3.9.18 and all named runtime/test d
 
 * Parse the telescope/camera identifier from the first portion of each image filename, for example `lsc1m004-fa03`. Derive the site code from its leading three characters, for example `lsc`.
 * Use `CALSPEC_spectra/alpha_lyr_stis_012.fits` as the Vega reference.
-* Interpret `passband_ingredients/kpnoextinct.dat.txt` as extinction coefficients in magnitudes per airmass and convert them to transmission before exponentiation by airmass.
+* Use the five `passband_ingredients/mean_atmospheric_transmission_*.ipac` files as fixed unit-airmass transmission fractions. Their wavelengths are nanometers and are converted to vacuum Angstroms internally.
+* Map image prefixes to atmosphere sites with `site_mapping.txt`: `lsc` to CTIO, `cpt` to Sutherland, `elp` to McDonald, `coj` to SidingSpring, and `tfn` to Tenerife-ish. Apply the selected curve as `T1**airmass` without rounding the measured airmass.
 * Interpret `passband_ingredients/aluminum_squared.txt` as already containing (A(\lambda)^2) and use it once.
 * Interpret nominal-filter wavelengths as nanometers, `QE.txt` values as percent, and all CALSPEC wavelengths as vacuum Angstroms. Work internally in vacuum Angstroms.
 * Use a starting grid-convergence tolerance of 0.0005 mag.

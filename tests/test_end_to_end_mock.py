@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from passband_fit.config import load_config
+from passband_fit.io import load_curve, load_site_mapping
 from passband_fit.hierarchical_model import HierarchicalPosterior
 from passband_fit.mock_data import make_mock_problem
 from passband_fit.numpyro_model import JaxPosteriorData, build_potential_fn
@@ -17,7 +18,7 @@ from passband_fit.pipeline import (
 
 
 @pytest.mark.parametrize(
-    "mode", ["shift_only", "shift_width", "shift_width_warp"]
+    "mode", ["fixed", "shift_only", "shift_width", "shift_width_warp"]
 )
 @pytest.mark.parametrize("magnitude_system", ["vega", "ab"])
 def test_mock_modes_and_magnitude_systems_are_finite(mode, magnitude_system):
@@ -66,11 +67,25 @@ def test_real_gp_preparation_and_baseline():
     assert prepared.grid_convergence_max_delta_mag < 5e-4
     assert np.isfinite(baseline["maximum_log_likelihood"])
     assert np.isfinite(posterior(layout.initial_vector(posterior.priors)))
+    prefix_to_site = load_site_mapping(config.inputs.site_mapping)
+    atmosphere_by_site = dict(
+        zip(
+            prepared.atmosphere_site_names,
+            prepared.unit_airmass_transmission_by_site,
+        )
+    )
+    for row, (prefix, airmass) in enumerate(
+        zip(prepared.selected.sites, prepared.selected.airmass)
+    ):
+        expected = atmosphere_by_site[prefix_to_site[prefix]] ** airmass
+        np.testing.assert_allclose(prepared.atmosphere_by_observation[row], expected)
 
 
-def test_real_gp_jax_potential_matches_full_numpy_likelihood():
+@pytest.mark.parametrize("mode", ["fixed", "shift_only"])
+def test_real_gp_jax_potential_matches_full_numpy_likelihood(mode):
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "example_config.yaml", selected_filter="gp")
+    config = replace(config, model=replace(config.model, passband_mode=mode))
     prepared = prepare_fit(config)
     layout, posterior = build_posterior(prepared)
     data = JaxPosteriorData(
@@ -99,14 +114,43 @@ def test_real_gp_jax_potential_matches_full_numpy_likelihood():
     assert float(-potential(theta)) == pytest.approx(posterior(theta), abs=2.0e-10)
 
 
+def test_fixed_boundary_diagnostics_omit_shape_parameters():
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "I.yaml", selected_filter="I")
+    config = replace(config, model=replace(config.model, passband_mode="fixed"))
+    problem = make_mock_problem("fixed", "vega", seed=6)
+    diagnostic = posterior_boundary_diagnostics(
+        np.repeat(problem.theta_truth[None, :], 3, axis=0),
+        problem.layout,
+        config,
+    )
+    assert diagnostic["parameters"] == {}
+    assert diagnostic["warning"] is False
+
+
 def test_rejects_atmosphere_with_non_negligible_blue_endpoint(tmp_path):
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "I_2.yaml", selected_filter="I")
-    raw = np.loadtxt(config.inputs.atmosphere.path)
+    site_name = "CTIO"
+    curve_config = config.inputs.atmospheres[site_name]
+    raw_curve = load_curve(curve_config, f"{site_name} atmosphere")
     truncated_path = tmp_path / "truncated_atmosphere.txt"
-    np.savetxt(truncated_path, raw[raw[:, 0] >= 3300.0])
-    atmosphere = replace(config.inputs.atmosphere, path=truncated_path)
-    config = replace(config, inputs=replace(config.inputs, atmosphere=atmosphere))
+    keep = raw_curve.wavelength_angstrom >= 3300.0
+    np.savetxt(
+        truncated_path,
+        np.column_stack((raw_curve.wavelength_angstrom[keep], raw_curve.values[keep])),
+    )
+    atmosphere = replace(
+        curve_config,
+        path=truncated_path,
+        wavelength_unit="angstrom",
+    )
+    atmospheres = dict(config.inputs.atmospheres)
+    atmospheres[site_name] = atmosphere
+    config = replace(
+        config,
+        inputs=replace(config.inputs, atmospheres=atmospheres),
+    )
     with pytest.raises(ValueError, match="atmosphere blue-edge coverage failure"):
         prepare_fit(config)
 
