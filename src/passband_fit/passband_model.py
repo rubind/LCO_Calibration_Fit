@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import numpy as np
 
 from .curves import (
@@ -103,16 +105,42 @@ def instrument_passband(
     warp_parameter: float = 0.0,
     warp_scale_angstrom: float,
     maximum_absolute_exponent: float = 100.0,
+    leak_scale: float = 1.0,
+    leak_window_angstrom: Optional[Tuple[float, float]] = None,
 ) -> np.ndarray:
-    """Construct a remapped, exponentially warped atmosphere-free response."""
+    """Remap with either an area-conserving warp or bounded leak attenuation.
 
+    The warp is normalized before multiplying by mirror/QE/atmosphere curves.
+    Width changes may change the area; the warp alone does not.
+    When leak boundaries are supplied, attenuate outside them in the nominal
+    filter frame before remapping, without a warp or area renormalization.
+    A zero blue boundary retains every wavelength at or below the red cutoff.
+    """
+
+    response = nominal_passband
+    if leak_window_angstrom is not None:
+        low, high = leak_window_angstrom
+        if not all(np.isfinite(v) for v in (low, high, leak_scale)) or not 0 <= low < high:
+            raise ValueError("leak window and scale must be finite with ordered boundaries and blue >= 0")
+        if not 0.0 <= leak_scale <= 1.0 or warp_parameter != 0.0:
+            raise ValueError("leak scale must be in [0, 1] and cannot be combined with a warp")
+        wave = validate_wavelength_grid(wavelength_angstrom)
+        response = np.asarray(nominal_passband, dtype=np.float64)
+        if response.shape != wave.shape or not np.all(np.isfinite(response)) or np.any(response < 0.0):
+            raise ValueError("nominal passband must be finite, nonnegative and match the wavelength grid")
+        inside = (wave >= low) & (wave <= high)
+        response = response * np.where(inside, 1.0, leak_scale)
     remapped = remap_passband(
         wavelength_angstrom,
-        nominal_passband,
+        response,
         pivot_wavelength_angstrom=pivot_wavelength_angstrom,
         delta_wavelength_angstrom=delta_wavelength_angstrom,
         width_scale=width_scale,
     )
+    if leak_window_angstrom is not None:
+        # Attenuation acts on the nominal filter before remapping. Its lost
+        # throughput is physical: do not area-normalize it or tilt the band.
+        return remapped
     warp = exponential_warp(
         wavelength_angstrom,
         pivot_wavelength_angstrom=pivot_wavelength_angstrom,
@@ -123,6 +151,7 @@ def instrument_passband(
     result = remapped * warp
     if not np.all(np.isfinite(result)) or not np.any(result > 0.0):
         raise ValueError("instrument passband is numerically invalid")
+    result = result * (np.trapz(remapped, wavelength_angstrom) / np.trapz(result, wavelength_angstrom))
     return np.asarray(result, dtype=np.float64)
 
 

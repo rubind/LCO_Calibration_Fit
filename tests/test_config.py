@@ -72,6 +72,25 @@ def test_example_config_loads_and_is_real_rooted():
     )
 
 
+def test_site_specific_resolved_config_round_trips_null_legacy_field(tmp_path):
+    config = load_config(ROOT / "example_config.yaml")
+    path = write_resolved_config(tmp_path / "resolved.yaml", config)
+    reloaded = load_config(path)
+    assert reloaded.model.atmosphere_mode == "site_specific"
+    assert reloaded.inputs.atmosphere is None
+    assert set(reloaded.inputs.atmospheres) == set(config.inputs.atmospheres)
+
+
+def test_legacy_resolved_config_round_trips_null_site_fields(tmp_path):
+    config = load_config(write_config(tmp_path, minimal_config()))
+    path = write_resolved_config(tmp_path / "resolved.yaml", config)
+    reloaded = load_config(path)
+    assert reloaded.model.atmosphere_mode == "fixed_kpno"
+    assert reloaded.inputs.atmosphere is not None
+    assert reloaded.inputs.atmospheres == {}
+    assert reloaded.inputs.site_mapping is None
+
+
 def test_all_standalone_filter_configs_use_numpyro_sampler_schema():
     expected_keys = {
         "num_warmup",
@@ -92,7 +111,7 @@ def test_all_standalone_filter_configs_use_numpyro_sampler_schema():
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert set(raw["sampler"]) == expected_keys, path
         config = load_config(path)
-        assert config.sampler.num_chains == 4
+        assert config.sampler.num_chains == (2 if path.stem.endswith("_modest") else 4)
         assert config.sampler.chain_method == "parallel"
         assert config.priors.star_correlated_scatter.scale == pytest.approx(0.03)
         assert config.model.atmosphere_mode == "site_specific"

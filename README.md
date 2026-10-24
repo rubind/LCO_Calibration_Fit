@@ -9,8 +9,10 @@ The detectors are photon counting. All wavelengths are converted to vacuum Angst
 For instrument `j`, the nominal filter is remapped as
 
 ```text
-Fj(lambda) = remap(filter, shift[j], width[j])
-             * exp(-warp[j] * (lambda - pivot) / warp_scale).
+Rj(lambda) = remap(filter, shift[j], width[j])
+Wj(lambda) = exp(-warp[j] * (lambda - pivot) / warp_scale)
+Cj = integral(Rj * Wj d_lambda) / integral(Rj d_lambda)
+Fj(lambda) = Rj(lambda) * Wj(lambda) / Cj.
 ```
 
 The source coordinate used to remap the nominal response is
@@ -24,6 +26,12 @@ Thus a positive shift moves the observed passband redward, and the shift remains
 ```text
 exp(-warp[j] * (lambda - pivot) / warp_scale).
 ```
+
+The warp normalization conserves the area of the shifted/stretched filter on
+its full wavelength grid. Width changes can change that area. This normalization
+is applied before the fixed mirror, detector, and atmospheric response. It
+cancels between the source and reference synthetic-flux integrals, so saved
+photometric fits and their residuals remain valid without resampling.
 
 The atmosphere-free instrumental response is
 
@@ -86,8 +94,109 @@ The supported values are:
   configured pivot; a width below 1 narrows it.
 
 - `shift_width_warp`: fits shift and width plus `warp[j]`, which multiplies the
-  response by `exp(-warp[j] * (lambda - pivot) / warp_scale)`. A positive warp
+  remapped filter by `exp(-warp[j] * (lambda - pivot) / warp_scale) / Cj`.
+  The normalization `Cj` conserves the remapped filter's area. A positive warp
   suppresses the red side relative to the blue side.
+
+- `shift_width_leak`: fits shift and width plus a camera-specific leak scale
+  between 0 and 1, with no warp. Supported for `U`, `up`, `gp` and `rp`.
+  Scale 1 retains the supplied out-of-band response; scale 0 removes it.
+
+For the leak mode, out-of-band means **wavelength >4500 Å for U and u′**
+(`U`, `up`), and **wavelength >8000 Å for g′ and r′** (`gp`, `rp`). All
+bluer response is retained. The defaults apply when the `leak` block is omitted;
+an explicit g′ or r′ configuration is:
+
+```yaml
+model:
+  passband_mode: shift_width_leak
+leak:
+  main_band_blue_angstrom: 0.0  # Zero disables blue-tail attenuation.
+  main_band_red_angstrom: 8000.0
+priors:
+  leak_logit_population_mean: {mean: 0.0, sigma: 1.5}
+  leak_logit_population_scale: {scale: 1.0}
+```
+
+Each camera has one scale for its red tail. The hierarchy is
+`leak_scale[j] = sigmoid(mu_leak_logit + tau_leak_logit*z_leak_logit[j])`.
+The population location has the configured Gaussian prior and its positive
+dispersion has the configured half-normal prior, both on the **logit** scale.
+The sampler explores the open interval (0, 1); the numerical curve evaluators
+also support exact 0 and 1 for comparisons. The physical-scale prior is not
+uniform. `population_leak_scale_median = sigmoid(mu_leak_logit)` is the
+conditional population median, not its arithmetic mean.
+
+The filter is attenuated above its nominal-frame cutoff **before**
+shift/width remapping, so those boundaries move with the filter. Mirror, QE,
+and atmospheric curves remain at their physical wavelengths. No area
+renormalization is applied. Source and reference photon integrals both use
+the modified response. In addition to standard coverage checks, the leak
+mode rejects a grid that truncates any positive transformed filter tail,
+even when it falls below `response_threshold`.
+
+The configurations `configs/U_leak.yaml`, `configs/up_leak.yaml`,
+`configs/gp_leak.yaml` and `configs/rp_leak.yaml` work directly with the main
+CLI. Their grids contain the full shifted/stretched tabulated filter support:
+
+```bash
+PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit validate --config configs/gp_leak.yaml --filter gp
+PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit fit --config configs/U_leak.yaml --filter U --run-label U-main-leak
+PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit fit --config configs/up_leak.yaml --filter up --run-label up-main-leak
+PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit fit --config configs/gp_leak.yaml --filter gp --run-label gp-main-leak
+PYTHONPATH=src /opt/anaconda3/bin/python -m passband_fit fit --config configs/rp_leak.yaml --filter rp --run-label rp-main-leak
+```
+
+Native leak runs include `leak_scales.csv`, physical and logit parameter
+summaries, leak boundary diagnostics, `plots/forest_leak_scale.png`, and the
+standard residual, posterior-passband, population-passband and predictive
+products. Main-CLI `plot` and `summarize` commands support these runs, and the
+population-passband, mean-wavelength and calibration-export tools preserve
+the leak parameter. The standalone `fit_shift_width_leak.py` is retained for
+compatibility and numerical comparison; new runs can use the main CLI.
+
+Explicit historical two-sided `leak` windows still load with their original
+meaning: both tails outside that retained interval share the camera scale.
+Saved pilot outputs retain those original windows in their resolved configs
+for reproducibility; use the production leak configs above for the current
+red-only definitions.
+
+On koa, `python run_all.py` submits the configured variants, including the
+four leak fits, using the project `.cluster-venv` environment. It preserves existing run
+outputs and the project observation file. Each job has a separate script in
+`batch_jobs/`. If a requested run directory already exists, the fitter creates
+a fresh numbered directory: `name`, `name-2`, `name-3`, and so on. Existing
+directories, including empty ones, are preserved. Names are reserved atomically
+so simultaneous launches cannot share a directory. This applies to every fit
+mode and the standalone leak script, including automatic Slurm requeues.
+Each launch starts a new fit; it does not resume an interrupted chain. The
+chosen directory is printed at startup and recorded in `manifest.json`.
+Preview scripts without submission, or submit just the four leak variants:
+
+```bash
+python run_all.py --dry-run
+python run_all.py --only U_leak up_leak gp_leak rp_leak
+# Add independent four-CPU repeats, with a distinct seed for each config:
+python run_all.py --cpus-per-task 4 --seed-base 67890
+```
+
+`--seed-base` adds each configuration's index in the full run list, so seeds
+remain stable when `--only` selects a subset. `--seed` instead uses one seed
+for every selected configuration. CPU variants have separate batch-script,
+log and output names, e.g. `U-production-cpu4-seed67890`. The fitter also accepts
+`fit --seed N`; the override is recorded in the resolved configuration and
+drives both the sampler and posterior-product random draws. Four chains are
+retained when requesting four CPUs. BLAS/OpenMP threads are limited to one
+per process to avoid nested thread pools.
+
+Create the isolated environment once on a compute node with
+`bash setup_cluster_env.sh`; it uses the existing `py312_LCO` Python as its
+base and installs the dependency ranges declared in `pyproject.toml`.
+The existing `py312_LCO` packages are unchanged. Jobs check their imports
+and do not install packages while running. `PASSBAND_CLUSTER_ENV` can select
+a different prepared environment. Koa's login node restricts executing
+user-installed binaries, so environment setup and runtime checks need a
+compute allocation.
 
 Every mode fits instrument zeropoints, marginalized per-star offsets and their
 common population scatter, and the common point-to-point extra-scatter term.
@@ -205,6 +314,105 @@ normalization and zeropoint information do not enter the plotted 68% interval.
 The regular `passband-fit plot` command and `rerun_all_plots.py` also regenerate
 this population-passband product for each run.
 
+To compare fit variants in one figure per band, use:
+
+```bash
+PYTHONPATH=src /opt/anaconda3/bin/python plot_fit_variants.py
+```
+
+This writes PNG and vector PDF figures to `figures/fit_variants/`, plus
+`fit_variants_summary.csv` with RMS values and source run directories. The left
+panel overlays the original passband and the population-mean medians and 68%
+intervals for shift, shift + width, and shift + width + warp, using the summary
+figures' model colors. The four right panels show the original residuals from
+the completed fixed run, followed by each variant's saved residuals **before
+star offsets**, with common wavelength limits, independent residual limits,
+and one star legend. Figures are 11.5 by 7.5 inches before tight cropping.
+The passband column takes two-thirds of the panel width, with the residuals
+in the remaining third.
+The left column has a main throughput panel starting at zero and a lower
+zoom panel spanning zero to 0.7% of the highest nominal or median peak transmission
+(with the upper limit rounded to one significant figure),
+occupying about 20% of its height. Both show the same curves
+and credible intervals on a shared wavelength axis spanning 0.3--1.1 microns.
+Comparison passbands are reconstructed from saved population-parameter draws
+without peak normalization or cross-model area matching. The warp alone
+conserves the shifted/stretched filter's area before multiplication by fixed
+aluminum², CCD QE, and the equal-site mean atmosphere at airmass 1.3:
+`mean_site(T_site**1.3)`. Site curves are read from each run's
+`nominal_curves.csv`; each site contributes once, independent of its number of
+cameras or observations. The final effective passband areas may differ because
+of width changes and wavelength-dependent instrument/atmospheric weighting.
+Individual-run population-passband products retain their atmosphere-free,
+unit-peak normalization. Residuals retain each actual observation's site and
+airmass, as used in the fits.
+When present, `runs/I/wrong_I/I_0-production-seed12345` adds a "Long-Pass I"
+curve and a top residual row to the I-band figure. This row uses that run's
+nominal residuals and its fitted `sigma_star`.
+Each observation retains its saved photon-weighted mean wavelength. Insets show
+the unweighted RMS and the posterior median of `sigma_star`, both in mmag;
+the latter is read from each run's `parameter_summary_physical.csv`. The original
+row reports the fixed run's `sigma_star`. The original row uses `nominal_residual`, not
+the fixed model's posterior residuals. Small differences between runs' nominal
+baselines are recorded in the CSV as `baseline_max_difference_mmag`.
+
+For g' and r', the completed `gp_leak-production-seed12345` and
+`rp_leak-production-seed12345` results replace shift + width + warp in these
+comparison figures and both all-band zeropoint/wavelength summaries. Short
+pilot leak runs are excluded, and the existing r' shift + width selection
+(`rp_2-production-seed22368`) is retained. Other bands keep their model variants.
+
+Only completed runs are used. Missing variants are explicitly marked; other duplicate
+completed runs for the same filter/mode or differing observation sets cause an
+error. Population-passband quantiles are evaluated from the saved chains using
+each run's configured plotting draw count. Use `--filters gp U` to
+select bands, or `--runs-dir` and `--output-dir` to choose other directories.
+
+To export calibration products from an explicit set of completed runs into one
+directory, run, for example:
+
+```bash
+PYTHONPATH=src /opt/anaconda3/bin/python export_calibration_products.py \
+  runs/U/U-production-seed12345 \
+  runs/B/B-production-seed12345 \
+  runs/V/V-production-seed12345 \
+  --output-dir calibration_export
+```
+
+The output directory receives the tab-separated summary files
+`camera_zeropoints_ab.txt` and `mean_wavelengths_airmass_1.3.txt`, one
+two-column passband file per camera (for example `V_cpt1m013-fa01.txt`), one
+`<filter>_population-median-hyperparameters.txt` passband, and one AB zeropoint
+covariance PNG plus one mean-wavelength covariance PNG per selected run. The
+mean-wavelength heatmap uses the same posterior draws as the wavelength summary
+and reports camera-by-camera covariance in vacuum Angstrom squared at the
+export airmass. Both covariance grids include the appropriate population-mean
+hyperparameter quantity as their first row and column (`mu_Z` or the effective
+wavelength of the population-mean passband), followed by the individual
+cameras. Passband columns are `wavelength` in vacuum Angstroms and
+physical `passband` throughput. Select at most one run per filter
+so these descriptive filenames remain unambiguous. In both summary tables, the
+first three columns are the passband filename without `.txt`, the posterior
+median, and a symmetric uncertainty equal to half the 16th--84th percentile
+width; the asymmetric bounds and other metadata follow. The first two tables contain a
+posterior-predictive `__new_camera__` row for each filter: it draws a new camera
+from the fitted population, so its interval includes both hyperparameter
+uncertainty and inferred camera-to-camera dispersion. The wavelength table uses
+the throughput centroid `integral(lambda*P)/integral(P)`. Camera passbands use
+the camera's site atmosphere; new-camera wavelengths and the median-population
+passband use the equal-site mean atmosphere. All passbands include airmass 1.3
+by default. Use
+`--airmass`, `--posterior-draws`, and `--seed` to override those defaults.
+Compact companions are also written: `camera_zeropoints_ab_compact.txt`
+contains only `passband_name` and `median_mag`. Use, for example,
+`--compact-zeropoint-prefix Sinistro_` to add that literal prefix to every
+first-column identifier; the default is no prefix. The
+`mean_wavelengths_airmass_1.3_compact.txt` contains only `passband_name`,
+`median_angstrom`, and `uncertainty_angstrom`.
+The tab-separated `filterwheel` file maps every exported `passband` identifier
+to its corresponding passband `filename`, including the population-median
+passband for each selected filter.
+
 To render the publication-style Daft probabilistic graphical model of the
 hierarchical calibration model, run:
 
@@ -214,8 +422,8 @@ hierarchical calibration model, run:
 
 This writes PNG and vector PDF versions under `figures/`. The diagram includes
 the camera and standard-star plates, passband-shape and zeropoint hierarchies,
-the analytically marginalized star offset, and the complete photon-counting
-wavelength integral.
+the analytically marginalized star offset, and the synthetic-photometry and
+observation dependencies.
 
 To make a LaTeX site-by-standard observing grid from a photometry table, run:
 
@@ -300,6 +508,19 @@ ranking of all candidate templates. Inspect these diagnostics before changing
 ## Outputs
 
 Each run stores the resolved configuration and input hashes, selection and index mappings, nominal component and combined curves, the authoritative NumPyro chain in `chain.npz`, flattened samples, parameter summaries and correlations, nominal and fitted synthetic magnitudes and residuals, posterior passband products, posterior-predictive summaries, plots, and a machine-readable manifest. The physical summaries include `sigma_star` and conditionally reconstructed `star_offset[target]` values, and `plots/forest_star_offset.png` shows their intervals. `nominal_curves.csv` contains every relevant site atmosphere plus a compatibility column holding their equally instrument-weighted mean. `zeropoint_conventions.json` records each instrument's nominal unit-airmass AB-minus-Vega conversion and uses their equal-weight mean for the population-mean zeropoint label; every likelihood integral uses the exact observation's site and airmass. The internal magnitude bookkeeping constant is not included. `diagnostics.json` and `diagnostics_by_parameter.csv` save R-hat, effective sample size, acceptance probabilities, divergences, tree-depth information, and the effective chain execution method. `boundary_diagnostics.json` reports posterior proximity to numerical shift/width/warp limits and the wavelength-grid endpoints.
+
+Target-residual plots include the filter and readable passband model in their
+filenames, for example `residuals_by_target_V_shift.png` and
+`residuals_by_target_V_shift_width.png`. These target plots use a compact canvas
+and 9-point panel titles so their annotations and star labels remain easy to
+read.
+
+Each `passbands_all_instruments_<filter>_<model>.png` plot shows effective
+passbands at airmass 1.3. Every instrument passband is multiplied by its own
+site's `T1**1.3`; the nominal population passband is multiplied by the
+equal-site mean of those airmass-1.3 transmissions. Plot regeneration for a
+legacy run uses its persisted single atmosphere for every curve, keeping the
+plot faithful to the inputs used for that fit.
 
 ## Verification
 

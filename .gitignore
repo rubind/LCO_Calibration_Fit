@@ -6,11 +6,14 @@ build/
 dist/
 outputs/
 runs/
+batch_jobs/
 *.h5
 .DS_Store
 *~
 .mplconfig/
 .venv/
+.cluster-venv/
+sync_backups/
 down.sh
 up.sh
 tmp.sh

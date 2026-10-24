@@ -86,6 +86,24 @@ class ModelConfig:
     airmass_round_decimals: Optional[int] = None
 
 
+# Zero disables blue-tail attenuation: only wavelengths strictly above the
+# red boundary are scaled. Explicit historical two-sided windows still load.
+DEFAULT_LEAK_WINDOWS = {"U": (0.0, 4500.0), "up": (0.0, 4500.0),
+                        "gp": (0.0, 8000.0), "rp": (0.0, 8000.0)}
+
+
+@dataclass(frozen=True)
+class LeakConfig:
+    """Retained nominal-frame region; blue=0 selects a red-only cutoff."""
+
+    main_band_blue_angstrom: float
+    main_band_red_angstrom: float
+
+    @property
+    def window(self) -> Tuple[float, float]:
+        return self.main_band_blue_angstrom, self.main_band_red_angstrom
+
+
 @dataclass(frozen=True)
 class BoundsConfig:
     shift_abs_max_angstrom: float = 250.0
@@ -117,6 +135,8 @@ class PriorsConfig:
     zeropoint_population_scale: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.2))
     star_correlated_scatter: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.03))
     extra_scatter: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.05))
+    leak_logit_population_mean: NormalPrior = field(default_factory=lambda: NormalPrior(0.0, 1.5))
+    leak_logit_population_scale: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(1.0))
 
 
 @dataclass(frozen=True)
@@ -158,6 +178,24 @@ class FitConfig:
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     plotting: PlottingConfig = field(default_factory=PlottingConfig)
     output: OutputConfig = field(default_factory=lambda: OutputConfig(Path("runs")))
+    leak: Optional[LeakConfig] = None
+
+
+def leak_window_for_config(config: FitConfig) -> Optional[Tuple[float, float]]:
+    """Resolve leak windows for loaded configs and programmatic replacements."""
+
+    if config.model.passband_mode != "shift_width_leak":
+        return None
+    if config.selected_filter not in DEFAULT_LEAK_WINDOWS:
+        raise ConfigError("shift_width_leak supports only U, up, gp and rp")
+    window = config.leak.window if config.leak is not None else DEFAULT_LEAK_WINDOWS[config.selected_filter]
+    if not all(math.isfinite(v) for v in window) or not 0 <= window[0] < window[1]:
+        raise ConfigError("leak boundaries must be finite and ordered with blue >= 0")
+    if not config.grid.minimum_angstrom < window[1] < config.grid.maximum_angstrom:
+        raise ConfigError("leak red boundary must lie strictly inside the wavelength grid")
+    if window[0] != 0 and not config.grid.minimum_angstrom < window[0]:
+        raise ConfigError("leak blue boundary must be zero or strictly inside the wavelength grid")
+    return window
 
 
 def _mapping(value: Any, where: str) -> Dict[str, Any]:
@@ -276,7 +314,7 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         raise ConfigError(f"could not load configuration {config_path}: {exc}") from exc
     raw = _mapping(raw_loaded, "configuration root")
     root_keys = ["schema_version", "selected_filter", "inputs", "selection", "grid", "model",
-                 "bounds", "priors", "sampler", "plotting", "output"]
+                 "bounds", "priors", "sampler", "plotting", "output", "leak"]
     _reject_unknown(raw, root_keys, "configuration root")
     if int(raw.get("schema_version", -1)) != 1:
         raise ConfigError("schema_version must be 1")
@@ -315,7 +353,9 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         raise ConfigError("inputs.filter_curves must not be empty")
     filter_curves = {str(key): _curve(value, base, f"inputs.filter_curves.{key}")
                      for key, value in filters_raw.items()}
-    atmospheres_raw = _mapping(inputs_raw.get("atmospheres", {}), "inputs.atmospheres")
+    atmospheres_raw = _mapping(
+        inputs_raw.get("atmospheres") or {}, "inputs.atmospheres"
+    )
     atmospheres = {
         str(key): _curve(value, base, f"inputs.atmospheres.{key}")
         for key, value in atmospheres_raw.items()
@@ -327,13 +367,13 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         aluminum_squared=_curve(inputs_raw["aluminum_squared"], base, "inputs.aluminum_squared"),
         atmosphere=(
             _curve(inputs_raw["atmosphere"], base, "inputs.atmosphere")
-            if "atmosphere" in inputs_raw
+            if inputs_raw.get("atmosphere") is not None
             else None
         ),
         atmospheres=atmospheres,
         site_mapping=(
             _path(inputs_raw["site_mapping"], base, "inputs.site_mapping")
-            if "site_mapping" in inputs_raw
+            if inputs_raw.get("site_mapping") is not None
             else None
         ),
         spectra_directory=_path(inputs_raw["spectra_directory"], base, "inputs.spectra_directory"),
@@ -377,6 +417,7 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         "shift_only",
         "shift_width",
         "shift_width_warp",
+        "shift_width_leak",
     }:
         raise ConfigError("unsupported model.passband_mode")
     if not math.isfinite(model.pivot_wavelength_angstrom) or model.pivot_wavelength_angstrom <= 0:
@@ -451,6 +492,10 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
                                              "priors.star_correlated_scatter"),
         extra_scatter=_half_normal(priors_raw.get("extra_scatter"), defaults.extra_scatter,
                                    "priors.extra_scatter"),
+        leak_logit_population_mean=_normal(priors_raw.get("leak_logit_population_mean"), defaults.leak_logit_population_mean,
+                                          "priors.leak_logit_population_mean"),
+        leak_logit_population_scale=_half_normal(priors_raw.get("leak_logit_population_scale"), defaults.leak_logit_population_scale,
+                                                "priors.leak_logit_population_scale"),
     )
 
     sampler_raw = _mapping(raw.get("sampler", {}), "sampler")
@@ -517,7 +562,22 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         effective_filter = str(effective_filter)
         if effective_filter not in filter_curves:
             raise ConfigError(f"selected filter {effective_filter!r} has no configured curve")
-    return FitConfig(
+    leak = None
+    if raw.get("leak") is not None:
+        leak_raw = _mapping(raw["leak"], "leak")
+        _reject_unknown(leak_raw, ["main_band_blue_angstrom", "main_band_red_angstrom"], "leak")
+        if model.passband_mode != "shift_width_leak":
+            raise ConfigError("leak settings require model.passband_mode=shift_width_leak")
+        defaults_window = DEFAULT_LEAK_WINDOWS.get(effective_filter)
+        if defaults_window is None:
+            raise ConfigError("shift_width_leak supports only U, up, gp and rp")
+        leak = LeakConfig(float(leak_raw.get("main_band_blue_angstrom", defaults_window[0])),
+                          float(leak_raw.get("main_band_red_angstrom", defaults_window[1])))
+    elif model.passband_mode == "shift_width_leak":
+        if effective_filter not in DEFAULT_LEAK_WINDOWS:
+            raise ConfigError("shift_width_leak supports only U, up, gp and rp")
+        leak = LeakConfig(*DEFAULT_LEAK_WINDOWS[effective_filter])
+    config = FitConfig(
         schema_version=1,
         selected_filter=effective_filter,
         inputs=inputs,
@@ -529,7 +589,10 @@ def load_config(path: PathLike, selected_filter: Optional[str] = None) -> FitCon
         sampler=sampler,
         plotting=plotting,
         output=output,
+        leak=leak,
     )
+    leak_window_for_config(config)
+    return config
 
 
 def config_to_dict(config: FitConfig, paths_as_strings: bool = True) -> Dict[str, Any]:

@@ -8,6 +8,7 @@ from typing import Mapping, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.special import expit
 
 from .passband_model import instrument_passband
 
@@ -38,6 +39,7 @@ def passband_model_label(passband_mode: str) -> str:
         "shift_only": "shift",
         "shift_width": "shift + width",
         "shift_width_warp": "shift + width + warp",
+        "shift_width_leak": "shift + width + leak",
     }
     try:
         return labels[passband_mode]
@@ -53,6 +55,23 @@ def passband_ensemble_filename(filter_name: str, passband_mode: str) -> str:
     if not safe_filter:
         raise ValueError("filter name contains no safe filename characters")
     return f"passbands_all_instruments_{safe_filter}_{passband_mode}.png"
+
+
+def residuals_by_target_filename(filter_name: str, passband_mode: str) -> str:
+    """Return the filter- and model-specific target-residual PNG name."""
+
+    model_tokens = {
+        "fixed": "fixed",
+        "shift_only": "shift",
+        "shift_width": "shift_width",
+        "shift_width_warp": "shift_width_warp",
+        "shift_width_leak": "shift_width_leak",
+    }
+    passband_model_label(passband_mode)  # Validate the canonical mode.
+    safe_filter = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(filter_name)).strip(".-")
+    if not safe_filter:
+        raise ValueError("filter name contains no safe filename characters")
+    return f"residuals_by_target_{safe_filter}_{model_tokens[passband_mode]}.png"
 
 
 def population_passband_filename(filter_name: str, passband_mode: str) -> str:
@@ -87,6 +106,8 @@ def corner_parameter_label(parameter_name: str) -> str:
         "log_tau_eta": "ln(ln-width Σ)",
         "mu_a": "population mean warp",
         "log_tau_a": "ln(warp Σ)",
+        "mu_leak_logit": "population mean logit(leak scale)",
+        "log_tau_leak_logit": "ln(logit-leak Σ)",
         "mu_Z": "population mean zeropoint [mag]",
         "log_tau_Z": "ln(zeropoint Σ / mag)",
         "log_sigma_star": "ln(star-residual Σ / mag)",
@@ -96,7 +117,7 @@ def corner_parameter_label(parameter_name: str) -> str:
     description = descriptions.get(name)
     if description is None:
         standardized = re.fullmatch(
-            r"z_(delta_lambda|eta|a|Z)\[(.+)\]",
+            r"z_(delta_lambda|eta|a|leak_logit|Z)\[(.+)\]",
             name,
         )
         if standardized is not None:
@@ -104,6 +125,7 @@ def corner_parameter_label(parameter_name: str) -> str:
                 "delta_lambda": "standardized instrument shift deviation",
                 "eta": "standardized instrument ln-width deviation",
                 "a": "standardized instrument warp deviation",
+                "leak_logit": "standardized instrument logit-leak deviation",
                 "Z": "standardized instrument zeropoint deviation",
             }
             description = family_descriptions[standardized.group(1)]
@@ -228,6 +250,8 @@ def plot_residual_comparison(
     filter_name: Optional[str] = None,
     panel_annotations: Optional[Sequence[Optional[str]]] = None,
     distinct_group_markers: bool = False,
+    figure_scale: float = 1.0,
+    title_fontsize: Optional[float] = None,
 ) -> plt.Figure:
     """Plot two or three stages of observed-minus-model residuals."""
 
@@ -270,6 +294,12 @@ def plot_residual_comparison(
     )
     if len(annotations) != len(panels):
         raise ValueError("panel_annotations must contain one entry per residual panel")
+    if not np.isfinite(figure_scale) or figure_scale <= 0.0:
+        raise ValueError("figure_scale must be finite and positive")
+    if title_fontsize is not None and (
+        not np.isfinite(title_fontsize) or title_fontsize <= 0.0
+    ):
+        raise ValueError("title_fontsize must be finite and positive")
     display_line_counts = []
     for title, annotation in zip(titles, annotations):
         line_count = title.count("\n") + 1
@@ -282,7 +312,10 @@ def plot_residual_comparison(
     figure, axes = plt.subplots(
         1,
         len(panels),
-        figsize=(6 * len(panels), figure_height),
+        figsize=(
+            figure_scale * 6 * len(panels),
+            figure_scale * figure_height,
+        ),
         sharey=True,
         squeeze=False,
     )
@@ -304,7 +337,11 @@ def plot_residual_comparison(
             title = f"{filter_name} — {title}\nRMS = {rms_mmag:.1f} mmag"
         if annotation:
             title = f"{title}\n{annotation}"
-        axis.set(xlabel=x_label, title=title)
+        axis.set_xlabel(x_label)
+        if title_fontsize is None:
+            axis.set_title(title)
+        else:
+            axis.set_title(title, fontsize=title_fontsize)
     axes[0].set_ylabel("observed - model magnitude")
     # Reserve a small explicit top margin because multi-line axes titles can
     # otherwise be clipped by some Matplotlib versions when saved tightly.
@@ -355,6 +392,8 @@ def population_mean_passband_quantiles(
     pivot_wavelength_angstrom: float,
     warp_scale_angstrom: float,
     maximum_draws: int,
+    normalize_peak: bool = True,
+    leak_window_angstrom: Optional[tuple] = None,
 ) -> np.ndarray:
     """Return pointwise 16/50/84% curves using population-mean parameters only.
 
@@ -362,7 +401,8 @@ def population_mean_passband_quantiles(
     aluminum-squared reflectivity, and fixed CCD QE. Every draw is divided by
     its own peak, removing the grey normalization that is degenerate with the
     additive zeropoint. Population dispersions and instrument deviations are
-    deliberately ignored.
+    deliberately ignored. Set ``normalize_peak=False`` to retain the response
+    amplitude, including area changes from width and an area-conserving warp.
     """
 
     passband_model_label(passband_mode)
@@ -400,10 +440,14 @@ def population_mean_passband_quantiles(
     required = []
     if passband_mode != "fixed":
         required.append("mu_delta_lambda")
-    if passband_mode in {"shift_width", "shift_width_warp"}:
+    if passband_mode in {"shift_width", "shift_width_warp", "shift_width_leak"}:
         required.append("mu_eta")
     if passband_mode == "shift_width_warp":
         required.append("mu_a")
+    if passband_mode == "shift_width_leak":
+        required.append("mu_leak_logit")
+        if leak_window_angstrom is None:
+            raise ValueError("leak population passbands require main-band boundaries")
     missing = [name for name in required if name not in parameter_names]
     if missing:
         raise ValueError(
@@ -412,7 +456,7 @@ def population_mean_passband_quantiles(
 
     fixed_response = components[1] * components[2]
 
-    def normalized_curve(shift: float, width: float, warp: float) -> np.ndarray:
+    def normalized_curve(shift: float, width: float, warp: float, leak: float = 1.0) -> np.ndarray:
         if passband_mode == "fixed":
             curve = components[0] * fixed_response
         else:
@@ -424,12 +468,14 @@ def population_mean_passband_quantiles(
                 width_scale=width,
                 warp_parameter=warp,
                 warp_scale_angstrom=warp_scale_angstrom,
+                leak_scale=leak,
+                leak_window_angstrom=leak_window_angstrom if passband_mode == "shift_width_leak" else None,
             )
             curve = curve * fixed_response
         peak = float(np.max(curve))
         if not np.isfinite(peak) or peak <= 0.0:
             raise ValueError("population passband has a nonpositive peak")
-        return curve / peak
+        return curve / peak if normalize_peak else curve
 
     if passband_mode == "fixed":
         curve = normalized_curve(0.0, 1.0, 0.0)
@@ -452,7 +498,8 @@ def population_mean_passband_quantiles(
             else 1.0
         )
         warp = float(draw[lookup["mu_a"]]) if "mu_a" in lookup else 0.0
-        curves[output_index] = normalized_curve(shift, width, warp)
+        leak = float(expit(draw[lookup["mu_leak_logit"]])) if "mu_leak_logit" in lookup else 1.0
+        curves[output_index] = normalized_curve(shift, width, warp, leak)
     return np.percentile(curves, [16.0, 50.0, 84.0], axis=0)
 
 
@@ -550,20 +597,54 @@ def plot_passband_ensemble(
     median_curves: np.ndarray,
     instrument_names: Sequence[str],
     nominal: Optional[Sequence[float]] = None,
+    instrument_atmospheric_transmission: Optional[Sequence[Sequence[float]]] = None,
+    nominal_atmospheric_transmission: Optional[Sequence[float]] = None,
+    atmospheric_airmass: float = 1.3,
     output_path: Optional[Union[Path, str]] = None,
     title: Optional[str] = None,
 ) -> plt.Figure:
-    """Compare posterior median instrumental passbands on one axis."""
+    """Compare instrumental passbands, optionally including atmosphere."""
 
     wave = np.asarray(wavelength_angstrom, dtype=np.float64)
     curves = np.asarray(median_curves, dtype=np.float64)
     if curves.shape != (len(instrument_names), len(wave)):
         raise ValueError("median_curves must have shape (instruments, wavelengths)")
+    atmosphere_applied = instrument_atmospheric_transmission is not None
+    if atmosphere_applied:
+        instrument_atmosphere = np.asarray(
+            instrument_atmospheric_transmission, dtype=np.float64
+        )
+        if (
+            instrument_atmosphere.shape != curves.shape
+            or not np.all(np.isfinite(instrument_atmosphere))
+            or np.any((instrument_atmosphere < 0.0) | (instrument_atmosphere > 1.0))
+        ):
+            raise ValueError(
+                "instrument_atmospheric_transmission must match median_curves "
+                "and lie in [0, 1]"
+            )
+        if not np.isfinite(atmospheric_airmass) or atmospheric_airmass <= 0.0:
+            raise ValueError("atmospheric_airmass must be finite and positive")
+        curves = curves * instrument_atmosphere
     figure, axis = plt.subplots(figsize=(10, 5))
     if nominal is not None:
         nominal_values = np.asarray(nominal, dtype=np.float64)
         if nominal_values.shape != wave.shape:
             raise ValueError("nominal must match wavelength grid")
+        if nominal_atmospheric_transmission is not None:
+            nominal_atmosphere = np.asarray(
+                nominal_atmospheric_transmission, dtype=np.float64
+            )
+            if (
+                nominal_atmosphere.shape != wave.shape
+                or not np.all(np.isfinite(nominal_atmosphere))
+                or np.any((nominal_atmosphere < 0.0) | (nominal_atmosphere > 1.0))
+            ):
+                raise ValueError(
+                    "nominal_atmospheric_transmission must match the wavelength "
+                    "grid and lie in [0, 1]"
+                )
+            nominal_values = nominal_values * nominal_atmosphere
         axis.plot(
             wave,
             nominal_values,
@@ -576,8 +657,12 @@ def plot_passband_ensemble(
     for curve, name in zip(curves, instrument_names):
         axis.plot(wave, curve, alpha=0.8, label=str(name), zorder=2)
     axis.set(
-        xlabel="wavelength (Angstrom)",
-        ylabel="relative throughput",
+        xlabel="vacuum wavelength (Å)",
+        ylabel=(
+            f"effective throughput at X={atmospheric_airmass:g}"
+            if atmosphere_applied
+            else "relative throughput"
+        ),
         title=title,
     )
     axis.legend(fontsize="small", ncol=2)

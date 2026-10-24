@@ -12,6 +12,18 @@ Any configuration can set `model.passband_mode: fixed` to hold the nominal
 passband exactly fixed while fitting only the instrument zeropoint hierarchy,
 the per-star correlated scatter, and the point-to-point extra scatter.
 
+`U_leak.yaml`, `up_leak.yaml`, `gp_leak.yaml` and `rp_leak.yaml` select the
+native `shift_width_leak` mode.
+They fit camera shifts, widths and leak scales with filter-level hyperparameters;
+the main CLI accepts them directly. Out-of-band means >4500 Å for U/u′ and
+>8000 Å for g′/r′, in the nominal filter frame. Their `leak` block uses
+`main_band_blue_angstrom: 0.0` to retain every bluer wavelength. The grids are
+1200–20000 Å for U, 2500–14000 Å for u′, and 2700–14000 Å for g′/r′ to contain
+the full shifted and stretched tabulated tails. Saved exploratory runs retain
+the original two-sided windows and two-chain, 300-warmup/300-draw settings in
+their resolved configs. See the main README for model definitions, priors and
+commands.
+
 | Filter | Pivot (A) | Warp scale (A) | Matching rows | Used rows | Targets | Instruments | Grid delta (mmag) |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | U  | 3600 | 800  | 126 | 126 | 10 | 11 | 0.192 |

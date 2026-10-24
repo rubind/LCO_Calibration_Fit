@@ -1,9 +1,11 @@
 import matplotlib
 import numpy as np
+import pandas as pd
 import pytest
 
 matplotlib.use("Agg")
 
+from passband_fit.cli import _stored_effective_atmospheres
 from passband_fit.diagnostics import (
     binned_residual_trend,
     information_criteria,
@@ -26,6 +28,7 @@ from passband_fit.plotting import (
     plot_passband_ensemble,
     plot_residual_comparison,
     plot_trace,
+    residuals_by_target_filename,
 )
 
 
@@ -56,6 +59,25 @@ def test_passband_ensemble_filename_includes_filter_and_model(
     filter_name, mode, expected
 ):
     assert passband_ensemble_filename(filter_name, mode) == expected
+
+
+@pytest.mark.parametrize(
+    ("filter_name", "mode", "expected"),
+    [
+        ("B", "fixed", "residuals_by_target_B_fixed.png"),
+        ("V", "shift_only", "residuals_by_target_V_shift.png"),
+        ("rp", "shift_width", "residuals_by_target_rp_shift_width.png"),
+        (
+            "z s",
+            "shift_width_warp",
+            "residuals_by_target_z-s_shift_width_warp.png",
+        ),
+    ],
+)
+def test_residuals_by_target_filename_includes_filter_and_model(
+    filter_name, mode, expected
+):
+    assert residuals_by_target_filename(filter_name, mode) == expected
 
 
 def test_residual_metrics_and_information_criteria():
@@ -206,6 +228,33 @@ def test_three_panel_residual_titles_include_filter_and_rms():
     )
 
 
+def test_residual_figure_scale_reduces_both_dimensions():
+    regular = plot_residual_comparison(
+        [1, 2], [0.1, -0.1], [1, 2], [0.05, -0.05]
+    )
+    compact = plot_residual_comparison(
+        [1, 2],
+        [0.1, -0.1],
+        [1, 2],
+        [0.05, -0.05],
+        figure_scale=0.8,
+    )
+    np.testing.assert_allclose(
+        compact.get_size_inches(), 0.8 * regular.get_size_inches()
+    )
+
+
+def test_residual_title_fontsize_can_be_reduced_independently():
+    figure = plot_residual_comparison(
+        [1, 2],
+        [0.1, -0.1],
+        [1, 2],
+        [0.05, -0.05],
+        title_fontsize=9.0,
+    )
+    assert all(axis.title.get_fontsize() == pytest.approx(9.0) for axis in figure.axes)
+
+
 @pytest.mark.parametrize(
     ("mode", "label"),
     (
@@ -250,6 +299,9 @@ def test_nominal_ensemble_curve_is_drawn_above_instruments():
         np.array([[0.1, 0.9], [0.2, 0.8]]),
         ["camera-a", "camera-b"],
         nominal=[0.15, 0.85],
+        instrument_atmospheric_transmission=[[0.4, 0.9], [0.5, 0.8]],
+        nominal_atmospheric_transmission=[0.45, 0.85],
+        atmospheric_airmass=1.3,
         title="V passbands — model: shift + width",
     )
     lines = figure.axes[0].lines
@@ -257,3 +309,33 @@ def test_nominal_ensemble_curve_is_drawn_above_instruments():
     instruments = [line for line in lines if line.get_label() != "nominal"]
     assert all(nominal.get_zorder() > line.get_zorder() for line in instruments)
     assert figure.axes[0].get_title() == "V passbands — model: shift + width"
+    assert len(figure.axes) == 1
+    np.testing.assert_allclose(nominal.get_ydata(), [0.15, 0.85] * np.array([0.45, 0.85]))
+    np.testing.assert_allclose(instruments[0].get_ydata(), [0.04, 0.81])
+    np.testing.assert_allclose(instruments[1].get_ydata(), [0.1, 0.64])
+    assert figure.axes[0].get_ylabel() == "effective throughput at X=1.3"
+
+
+def test_stored_atmospheres_map_instruments_and_average_sites_after_scaling():
+    curves = pd.DataFrame(
+        {
+            "unit_airmass_transmission": [0.1, 0.1],
+            "unit_airmass_transmission_CTIO": [0.5, 0.8],
+            "unit_airmass_transmission_Sutherland": [0.7, 0.9],
+        }
+    )
+    expected = np.mean(np.array([[0.5, 0.8], [0.7, 0.9]]) ** 1.3, axis=0)
+    instruments, mean = _stored_effective_atmospheres(
+        curves,
+        ["camera-a", "camera-b"],
+        {
+            "instrument_atmosphere_sites": {
+                "camera-a": "CTIO",
+                "camera-b": "Sutherland",
+            }
+        },
+        1.3,
+    )
+    np.testing.assert_allclose(instruments[0], np.array([0.5, 0.8]) ** 1.3)
+    np.testing.assert_allclose(instruments[1], np.array([0.7, 0.9]) ** 1.3)
+    np.testing.assert_allclose(mean, expected)

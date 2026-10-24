@@ -49,6 +49,7 @@ class JaxPosteriorData:
     width_max: float
     warp_abs_max: float
     response_threshold: float
+    leak_window_angstrom: tuple[float, float] | None = None
 
 
 def _normal_logpdf(value: Array, mean: float, sigma: float) -> Array:
@@ -98,6 +99,8 @@ def _unpack_theta_jax(
     else:
         values["sigma_star"] = jnp.asarray(0.0, dtype=jnp.float64)
     values["width"] = jnp.exp(values["eta"])
+    values["leak_scale"] = (jax.nn.sigmoid(values["leak_logit"]) if "leak_logit" in values
+                            else jnp.ones(layout.n_instruments, dtype=jnp.float64))
     values["sigma_extra"] = jnp.exp(theta[-1])
     return values, log_prior
 
@@ -115,6 +118,8 @@ def build_potential_fn(
     """
 
     wave = jnp.asarray(data.wavelength_angstrom, dtype=jnp.float64)
+    if layout.mode == "shift_width_leak" and data.leak_window_angstrom is None:
+        raise ValueError("shift_width_leak requires nominal-frame main-band boundaries")
     integration_weight = jnp.asarray(data.trapezoid_weights, dtype=jnp.float64)
     filter_transmission = jnp.asarray(data.filter_transmission, dtype=jnp.float64)
     fixed_instrument_response = jnp.asarray(
@@ -172,6 +177,8 @@ def build_potential_fn(
                 widths,
                 warps,
                 warp_scale,
+                leak_scale=parameters["leak_scale"],
+                leak_window_angstrom=data.leak_window_angstrom if layout.mode == "shift_width_leak" else None,
             )
         instrument_curves = instrument_curves * fixed_instrument_response[None, :]
         effective = instrument_curves[instrument_index] * atmosphere

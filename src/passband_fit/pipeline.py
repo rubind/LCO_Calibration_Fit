@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-from .config import FitConfig
+from .config import FitConfig, LeakConfig, leak_window_for_config
 from .contracts import SelectedData
 from .curves import (
     combine_nominal_components,
@@ -59,9 +59,11 @@ from .plotting import (
     plot_passband_ensemble,
     plot_residual_comparison,
     plot_trace,
+    residuals_by_target_filename,
 )
 from .numpyro_model import JaxPosteriorData, build_potential_fn
 from .numpyro_sampler import NumpyroResult, NumpyroSettings, run_numpyro_nuts
+from .run_directories import reserve_run_directory
 from .synthetic_photometry import (
     ab_magnitude,
     ab_reference_flux_lambda,
@@ -121,6 +123,10 @@ class PreparedFit:
                 (count, len(self.wavelength_angstrom)),
             ).copy()
         curves = np.empty((count, len(self.wavelength_angstrom)))
+        leak_window = leak_window_for_config(self.config)
+        leak_scales = np.asarray(parameters.get("leak_scale", np.ones(count)), dtype=float)
+        if leak_scales.shape != (count,):
+            raise ValueError("leak scale array has the wrong shape")
         for index in range(count):
             curves[index] = instrument_passband(
                 self.wavelength_angstrom,
@@ -130,6 +136,8 @@ class PreparedFit:
                 width_scale=float(widths[index]),
                 warp_parameter=float(warps[index]),
                 warp_scale_angstrom=self.config.model.warp_scale_angstrom,
+                leak_scale=float(leak_scales[index]),
+                leak_window_angstrom=leak_window,
             )
             curves[index] *= self.aluminum_squared * self.quantum_efficiency
         return curves
@@ -437,6 +445,21 @@ def _convergence_check(
 def prepare_fit(config: FitConfig) -> PreparedFit:
     """Load all real inputs and fail if any reference spectrum lacks coverage."""
 
+    leak_window = leak_window_for_config(config)
+    if leak_window is not None:
+        if config.leak is None:
+            config = replace(config, leak=LeakConfig(*leak_window))
+        native = load_filter_curve(config)
+        first, last = native.wavelength_angstrom[native.values > 0.0][[0, -1]]
+        pivot = config.model.pivot_wavelength_angstrom
+        bounds = config.bounds
+        widths = (bounds.width_min, bounds.width_max)
+        margin = 2 * config.grid.spacing_angstrom * max(1.0, bounds.width_max)
+        low = min(first, *[pivot + (first-pivot)*w-bounds.shift_abs_max_angstrom for w in widths])-margin
+        high = max(last, *[pivot + (last-pivot)*w+bounds.shift_abs_max_angstrom for w in widths])+margin
+        if config.grid.minimum_angstrom > low or config.grid.maximum_angstrom < high:
+            raise ValueError(f"grid would truncate the transformed out-of-band filter: cover at least "
+                             f"{low:.1f}--{high:.1f} Angstrom including interpolation margin")
     initial = load_selected_data(config)
     prefix_to_site, atmosphere_curves = load_atmosphere_curves(
         config, initial.sites
@@ -592,6 +615,7 @@ def nominal_parameters(prepared: PreparedFit) -> Dict[str, object]:
         "warp": np.zeros(count),
         "zeropoint": np.zeros(count),
         "sigma_extra": 0.0,
+        "leak_scale": np.ones(count),
     }
 
 
@@ -659,6 +683,8 @@ def model_priors(config: FitConfig) -> ModelPriors:
             "zeropoint_population_scale": config.priors.zeropoint_population_scale,
             "star_correlated_scatter": config.priors.star_correlated_scatter,
             "extra_scatter": config.priors.extra_scatter,
+            "leak_logit_population_mean": config.priors.leak_logit_population_mean,
+            "leak_logit_population_scale": config.priors.leak_logit_population_scale,
         }
     )
 
@@ -712,6 +738,7 @@ def _safe_label(value: str) -> str:
 
 
 def create_run_directory(config: FitConfig, run_label: Optional[str] = None) -> Path:
+    """Reserve a fresh output directory, adding a numeric suffix on collisions."""
     label = (
         run_label
         or config.output.run_label
@@ -722,10 +749,7 @@ def create_run_directory(config: FitConfig, run_label: Optional[str] = None) -> 
         / _safe_label(str(config.selected_filter))
         / _safe_label(label)
     )
-    if destination.exists() and any(destination.iterdir()):
-        raise FileExistsError(f"refusing to overwrite nonempty run directory: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
-    return destination
+    return reserve_run_directory(destination)
 
 
 def _conditional_star_draws(
@@ -796,6 +820,13 @@ def posterior_boundary_diagnostics(
             np.asarray([draw["warp"] for draw in physical]),
             config.bounds.warp_abs_max,
         )
+    if "leak_logit" in layout.enabled_families:
+        scales = np.asarray([draw["leak_scale"] for draw in physical])
+        result["parameters"]["leak_scale"] = {
+            "hard_min": 0.0, "hard_max": 1.0,
+            "posterior_min": float(np.min(scales)), "posterior_max": float(np.max(scales)),
+            "fraction_in_outer_10_percent": float(np.mean((scales < 0.1) | (scales > 0.9))),
+        }
     if passband_draws is not None:
         curves = np.asarray(passband_draws, dtype=np.float64)
         peak = np.max(curves, axis=-1)
@@ -871,6 +902,10 @@ def _write_products(
         reconstructed_summary["maximum_posterior"] = np.nan
         physical_summary = pd.concat([physical_summary, reconstructed_summary])
     physical_summary.to_csv(run_dir / "parameter_summary_physical.csv")
+    if "leak_logit" in layout.enabled_families:
+        rows = physical_summary.loc[[f"leak_scale[{name}]" for name in prepared.selected.instrument_names]].reset_index()
+        rows.insert(0, "instrument", prepared.selected.instrument_names)
+        write_csv(run_dir / "leak_scales.csv", rows)
     covariance, correlation = posterior_matrices(flat, layout.parameter_names)
     covariance.to_csv(run_dir / "posterior_covariance.csv")
     correlation.to_csv(run_dir / "posterior_correlation.csv")
@@ -1064,6 +1099,10 @@ def _write_products(
     plot_acceptance_fractions(
         result.diagnostics.acceptance_probability_by_chain, plots / "acceptance.png"
     )
+    target_residual_path = plots / residuals_by_target_filename(
+        str(prepared.config.selected_filter),
+        prepared.config.model.passband_mode,
+    )
     plot_residual_comparison(
         nominal_wave,
         baseline["residual"],
@@ -1094,9 +1133,14 @@ def _write_products(
             star_dispersion_annotation,
         ),
         distinct_group_markers=True,
+        figure_scale=0.8,
+        title_fontsize=9.0,
         filter_name=str(prepared.config.selected_filter),
-        output_path=plots / "residuals_by_target.png",
+        output_path=target_residual_path,
     )
+    legacy_target_residual_plot = plots / "residuals_by_target.png"
+    if legacy_target_residual_plot.is_file():
+        legacy_target_residual_plot.unlink()
     for label, values in (
         ("airmass", prepared.selected.airmass),
         ("observed_magnitude", prepared.selected.observed_magnitude),
@@ -1118,6 +1162,14 @@ def _write_products(
         quantiles[1],
         prepared.selected.instrument_names,
         nominal=prepared.nominal_passband,
+        instrument_atmospheric_transmission=(
+            prepared.unit_airmass_transmission_by_instrument**1.3
+        ),
+        nominal_atmospheric_transmission=np.mean(
+            prepared.unit_airmass_transmission_by_site**1.3,
+            axis=0,
+        ),
+        atmospheric_airmass=1.3,
         title=(
             f"{prepared.config.selected_filter} passbands — model: "
             f"{passband_model_label(prepared.config.model.passband_mode)}"
@@ -1155,6 +1207,12 @@ def _write_products(
     if "a" in layout.enabled_families:
         family_keys.append(("warp", "mu_a", "tau_a"))
     family_keys.append(("zeropoint", "mu_Z", "tau_Z"))
+    if "leak_logit" in layout.enabled_families:
+        values = np.asarray([draw["leak_scale"] for draw in physical_draws])
+        low, center, high = np.percentile(values, [16, 50, 84], axis=0)
+        # Logit dispersion is not a dispersion in physical leak scale.
+        plot_forest(prepared.selected.instrument_names, center, low, high,
+                    parameter_label="leak scale (0–1)", output_path=plots / "forest_leak_scale.png")
     for family, mu_key, tau_key in family_keys:
         values = np.asarray([draw[family] for draw in physical_draws])
         low, center, high = np.percentile(values, [16, 50, 84], axis=0)
@@ -1387,9 +1445,11 @@ def run_fit(
         numpyro.set_host_device_count(settings.num_chains)
 
     prepared = prepare_fit(config)
+    config = prepared.config
     layout, posterior = build_posterior(prepared)
     run_kind = "smoke" if sampler_override is not None else "production"
     run_dir = create_run_directory(config, run_label)
+    print(f"Run output directory: {run_dir}", flush=True)
     write_resolved_config(run_dir / "resolved_config.yaml", config)
     write_json(run_dir / "selection_summary.json", prepared.selected.summary)
     write_json(
@@ -1431,7 +1491,16 @@ def run_fit(
             "grid_convergence_max_delta_mag": prepared.grid_convergence_max_delta_mag,
             "coverage_excluded_targets": prepared.coverage_excluded_targets,
             "run_kind": run_kind,
+            "run_label": run_dir.name,
+            "run_directory": str(run_dir.resolve()),
+            "requested_run_label": run_label or config.output.run_label,
             "convergence_claim": False,
+            "passband_mode": config.model.passband_mode,
+            "leak_model": ({"main_band_angstrom": list(leak_window_for_config(config)),
+                            "bounds": [0.0, 1.0], "prior_coordinate": "logit",
+                            "region_frame": "nominal filter before shift and width",
+                            "normalization": "none"}
+                           if config.model.passband_mode == "shift_width_leak" else None),
             "effective_sampler_settings": asdict(settings),
         },
     )
@@ -1458,6 +1527,7 @@ def run_fit(
         width_max=config.bounds.width_max,
         warp_abs_max=config.bounds.warp_abs_max,
         response_threshold=config.grid.response_threshold,
+        leak_window_angstrom=leak_window_for_config(config),
     )
     potential_fn = build_potential_fn(posterior_data, layout, posterior.priors)
     center = initial_vector_from_baseline(layout, model_priors(config), baseline)
@@ -1500,6 +1570,7 @@ def run_fit(
     )
     summary = {
         "selected_filter": config.selected_filter,
+        "passband_mode": config.model.passband_mode,
         "n_observations": len(prepared.selected.row_id),
         "n_targets": len(prepared.selected.target_names),
         "n_instruments": len(prepared.selected.instrument_names),

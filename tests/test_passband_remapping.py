@@ -105,3 +105,22 @@ def test_instrument_passband_and_boundary_detection() -> None:
     assert not support_reaches_grid_boundary(fitted, relative_threshold=1.0e-4)
     assert support_reaches_grid_boundary(np.ones_like(wavelength))
 
+
+@pytest.mark.parametrize("warp", [-0.7, 0.0, 0.8])
+def test_warp_conserves_remapped_filter_area_and_magnitude(warp):
+    from passband_fit.synthetic_photometry import vega_magnitude
+
+    wavelength = np.linspace(3500., 7000., 2001) ** 1.0001
+    nominal = np.exp(-0.5 * ((wavelength - 5100.) / 240.) ** 2)
+    kwargs = dict(pivot_wavelength_angstrom=5000., delta_wavelength_angstrom=50., width_scale=1.15)
+    remapped = remap_passband(wavelength, nominal, **kwargs)
+    fitted = instrument_passband(wavelength, nominal, **kwargs, warp_parameter=warp, warp_scale_angstrom=1000.)
+    np.testing.assert_allclose(np.trapz(fitted, wavelength), np.trapz(remapped, wavelength), rtol=2e-15)
+    old_response = remapped * exponential_warp(
+        wavelength, pivot_wavelength_angstrom=5000., warp_parameter=warp, warp_scale_angstrom=1000.)
+    fixed_response = (wavelength / 5000.) ** -0.3
+    source = (wavelength / 5000.) ** -1.5
+    reference = (wavelength / 5000.) ** -3.
+    assert vega_magnitude(wavelength, source, reference, fitted * fixed_response) == pytest.approx(
+        vega_magnitude(wavelength, source, reference, old_response * fixed_response), abs=2e-14)
+

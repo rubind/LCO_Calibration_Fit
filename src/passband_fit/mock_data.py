@@ -88,6 +88,8 @@ def make_mock_problem(
                 width_scale=widths[index],
                 warp_parameter=warps[index],
                 warp_scale_angstrom=1100.0,
+                leak_scale=np.asarray(parameters["leak_scale"])[index],
+                leak_window_angstrom=(4200.0, 6200.0) if mode == "shift_width_leak" else None,
             )
             for index in range(n_instruments)
         ]
@@ -116,6 +118,8 @@ def make_mock_problem(
     warps = np.linspace(-0.08, 0.08, n_instruments)
     if "a" in layout.enabled_families:
         _set_family(theta, layout, "a", warps, 0.08)
+    if "leak_logit" in layout.enabled_families:
+        _set_family(theta, layout, "leak_logit", np.linspace(-0.8, 0.8, n_instruments), 0.8)
     zeropoints = np.linspace(-0.12, 0.12, n_instruments)
     _set_family(theta, layout, "Z", zeropoints, 0.12)
     log_sigma_star_index, _ = layout.star_indices()

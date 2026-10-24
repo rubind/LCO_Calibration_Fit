@@ -14,9 +14,10 @@ from math import log, pi
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from scipy.special import expit
 
 
-VALID_MODES = ("fixed", "shift_only", "shift_width", "shift_width_warp")
+VALID_MODES = ("fixed", "shift_only", "shift_width", "shift_width_warp", "shift_width_leak")
 Array = np.ndarray
 SyntheticMagnitudeEvaluator = Callable[[Mapping[str, object]], Array]
 
@@ -58,6 +59,8 @@ class ModelPriors:
     tau_Z: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.2))
     sigma_star: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.03))
     sigma_extra: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(0.05))
+    mu_leak_logit: NormalPrior = field(default_factory=lambda: NormalPrior(0.0, 1.5))
+    tau_leak_logit: HalfNormalPrior = field(default_factory=lambda: HalfNormalPrior(1.0))
 
     @classmethod
     def from_mapping(cls, values: Optional[object]) -> "ModelPriors":
@@ -82,8 +85,10 @@ class ModelPriors:
             "tau_Z": "zeropoint_population_scale",
             "sigma_star": "star_correlated_scatter",
             "sigma_extra": "extra_scatter",
+            "mu_leak_logit": "leak_logit_population_mean",
+            "tau_leak_logit": "leak_logit_population_scale",
         }
-        normal_names = ("mu_delta_lambda", "mu_eta", "mu_a", "mu_Z")
+        normal_names = ("mu_delta_lambda", "mu_eta", "mu_a", "mu_Z", "mu_leak_logit")
         half_names = (
             "tau_delta_lambda",
             "tau_eta",
@@ -91,6 +96,7 @@ class ModelPriors:
             "tau_Z",
             "sigma_star",
             "sigma_extra",
+            "tau_leak_logit",
         )
         kwargs: Dict[str, object] = {}
 
@@ -169,10 +175,12 @@ class ParameterLayout:
         families = []
         if self.mode != "fixed":
             families.append("delta_lambda")
-        if self.mode in ("shift_width", "shift_width_warp"):
+        if self.mode in ("shift_width", "shift_width_warp", "shift_width_leak"):
             families.append("eta")
         if self.mode == "shift_width_warp":
             families.append("a")
+        if self.mode == "shift_width_leak":
+            families.append("leak_logit")
         families.append("Z")
         return tuple(families)
 
@@ -281,6 +289,9 @@ class ParameterLayout:
         result["zeropoint"] = np.asarray(result["Z"])
         result["instrument_names"] = self.instrument_names
         result["target_names"] = self.target_names
+        result["leak_scale"] = expit(result["leak_logit"]) if "leak_logit" in result else np.ones(self.n_instruments)
+        if "leak_logit" in result:
+            result["population_leak_scale_median"] = float(expit(result["mu_leak_logit"]))
         return result
 
     @property
@@ -296,6 +307,9 @@ class ParameterLayout:
         if self.n_targets:
             names.append("sigma_star")
         names.append("sigma_extra")
+        if "leak_logit" in self.enabled_families:
+            names.append("population_leak_scale_median")
+            names.extend(f"leak_scale[{name}]" for name in self.instrument_names)
         return tuple(names)
 
     def derived_vector(self, theta: Sequence[float]) -> Array:
@@ -311,6 +325,9 @@ class ParameterLayout:
         if self.n_targets:
             values.append(unpacked["sigma_star"])
         values.append(unpacked["sigma_extra"])
+        if "leak_logit" in self.enabled_families:
+            values.append(unpacked["population_leak_scale_median"])
+            values.extend(unpacked["leak_scale"])
         return np.asarray(values, dtype=np.float64)
 
     def initial_vector(self, priors: Optional[ModelPriors] = None) -> Array:

@@ -126,9 +126,23 @@ def instrument_passband(
     warp_parameter: object = 0.0,
     warp_scale_angstrom: object = 1.0,
     maximum_absolute_exponent: object = 100.0,
+    leak_scale: object = 1.0,
+    leak_window_angstrom: Optional[tuple] = None,
 ) -> Array:
-    """Construct one differentiable atmosphere-free instrument passband."""
+    """Remap with an area-conserving warp or nominal-frame leak attenuation."""
 
+    if leak_window_angstrom is not None:
+        wavelength = _float64(wavelength_angstrom)
+        low, high = leak_window_angstrom
+        scale = _float64(leak_scale)
+        inside = (wavelength >= low) & (wavelength <= high)
+        response = _float64(nominal_passband) * jnp.where(inside, 1.0, scale)
+        remapped = remap_passband(wavelength, response, pivot_wavelength_angstrom,
+                                  delta_wavelength_angstrom, width_scale)
+        valid = (jnp.isfinite(scale) & (scale >= 0.0) & (scale <= 1.0) &
+                 jnp.isfinite(low) & jnp.isfinite(high) &
+                 (low >= 0.0) & (high > low) & (_float64(warp_parameter) == 0.0))
+        return jnp.where(valid, remapped, jnp.nan)
     remapped = remap_passband(
         wavelength_angstrom,
         nominal_passband,
@@ -143,7 +157,10 @@ def instrument_passband(
         warp_scale_angstrom,
         maximum_absolute_exponent,
     )
-    return remapped * warp
+    warped = remapped * warp
+    weights = trapezoid_weights(wavelength_angstrom)
+    scale = jnp.sum(weights * remapped) / jnp.sum(weights * warped)
+    return warped * scale
 
 
 def instrument_passbands(
@@ -155,12 +172,20 @@ def instrument_passbands(
     warp_parameter: object,
     warp_scale_angstrom: object,
     maximum_absolute_exponent: object = 100.0,
+    leak_scale: Optional[object] = None,
+    leak_window_angstrom: Optional[tuple] = None,
 ) -> Array:
     """Vectorize :func:`instrument_passband` over instrument parameters."""
 
     shifts = _float64(delta_wavelength_angstrom)
     widths = _float64(width_scale)
     warps = _float64(warp_parameter)
+    if leak_window_angstrom is not None:
+        scales = jnp.ones_like(shifts) if leak_scale is None else _float64(leak_scale)
+        return jax.vmap(lambda shift, width, warp, scale: instrument_passband(
+            wavelength_angstrom, nominal_passband, pivot_wavelength_angstrom,
+            shift, width, warp, warp_scale_angstrom, maximum_absolute_exponent,
+            scale, leak_window_angstrom))(shifts, widths, warps, scales)
 
     def one(shift: Array, width: Array, warp: Array) -> Array:
         return instrument_passband(

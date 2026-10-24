@@ -18,7 +18,7 @@ from passband_fit.pipeline import (
 
 
 @pytest.mark.parametrize(
-    "mode", ["fixed", "shift_only", "shift_width", "shift_width_warp"]
+    "mode", ["fixed", "shift_only", "shift_width", "shift_width_warp", "shift_width_leak"]
 )
 @pytest.mark.parametrize("magnitude_system", ["vega", "ab"])
 def test_mock_modes_and_magnitude_systems_are_finite(mode, magnitude_system):

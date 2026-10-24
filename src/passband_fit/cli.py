@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import logging
 import os
@@ -33,16 +34,74 @@ from .plotting import (
     passband_model_label,
     plot_acceptance_fractions,
     plot_corner,
+    plot_forest,
     plot_log_probability_trace,
     plot_passband_ensemble,
     plot_residual_comparison,
     plot_trace,
+    residuals_by_target_filename,
 )
 from .numpyro_sampler import NumpyroSettings
 from .synthetic_photometry import ab_magnitude
 
 
 LOGGER = logging.getLogger("passband_fit")
+
+
+def _stored_effective_atmospheres(
+    curves: pd.DataFrame,
+    instrument_names: Sequence[str],
+    index_mappings: dict,
+    airmass: float = 1.3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-instrument and equal-site-mean persisted atmospheres.
+
+    Runs predating site-specific atmospheres contain only the legacy
+    representative curve; it is then used for every instrument and for the
+    nominal curve so regenerated plots remain faithful to those old runs.
+    """
+
+    prefix = "unit_airmass_transmission_"
+    site_columns = [name for name in curves.columns if name.startswith(prefix)]
+    if not site_columns:
+        column = "unit_airmass_transmission"
+        if column not in curves:
+            raise ValueError(
+                "nominal_curves.csv lacks unit_airmass_transmission"
+            )
+        atmosphere = curves[column].to_numpy(dtype=float) ** float(airmass)
+        return (
+            np.broadcast_to(atmosphere, (len(instrument_names), len(atmosphere))).copy(),
+            atmosphere,
+        )
+
+    atmosphere_by_site = {
+        name[len(prefix) :]: curves[name].to_numpy(dtype=float) ** float(airmass)
+        for name in site_columns
+    }
+    instrument_sites = index_mappings.get("instrument_atmosphere_sites", {})
+    missing_instruments = [
+        name for name in instrument_names if name not in instrument_sites
+    ]
+    if missing_instruments:
+        raise ValueError(
+            "index_mappings.json lacks atmosphere sites for instrument(s): "
+            + ", ".join(missing_instruments)
+        )
+    missing_sites = sorted(
+        {instrument_sites[name] for name in instrument_names}
+        - set(atmosphere_by_site)
+    )
+    if missing_sites:
+        raise ValueError(
+            "nominal_curves.csv lacks atmosphere curve(s) for site(s): "
+            + ", ".join(missing_sites)
+        )
+    instrument_atmospheres = np.asarray(
+        [atmosphere_by_site[instrument_sites[name]] for name in instrument_names]
+    )
+    mean_atmosphere = np.mean(list(atmosphere_by_site.values()), axis=0)
+    return instrument_atmospheres, mean_atmosphere
 
 
 def _saved_ab_minus_vega(run_dir: Path, curves: pd.DataFrame) -> tuple[str, float]:
@@ -131,6 +190,7 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--config", type=Path)
     fit.add_argument("--filter")
     fit.add_argument("--run-label")
+    fit.add_argument("--seed", type=int, help="Override sampler.random_seed in the saved run configuration")
     fit.add_argument(
         "--resume",
         type=Path,
@@ -241,8 +301,16 @@ def _regenerate_plots(run_dir: Path) -> None:
             unit="mag",
         )
     instruments = tuple(dict.fromkeys(residuals["instrument"].astype(str)))
+    if run_config.model.passband_mode == "shift_width_leak":
+        physical = pd.read_csv(run_dir / "parameter_summary_physical.csv").set_index("parameter")
+        scales = physical.loc[[f"leak_scale[{name}]" for name in instruments]]
+        plot_forest(instruments, scales["median"].to_numpy(), scales["q16"].to_numpy(), scales["q84"].to_numpy(),
+                    parameter_label="leak scale (0–1)", output_path=plots / "forest_leak_scale.png")
     lookup = {name: index for index, name in enumerate(instruments)}
     groups = residuals["instrument"].map(lookup).to_numpy()
+    target_residual_path = plots / residuals_by_target_filename(
+        filter_name, run_config.model.passband_mode
+    )
     plot_residual_comparison(
         residuals["nominal_mean_wavelength_angstrom"],
         residuals["nominal_residual"],
@@ -303,16 +371,32 @@ def _regenerate_plots(run_dir: Path) -> None:
         groups=target_groups,
         group_names=targets,
         distinct_group_markers=True,
+        figure_scale=0.8,
+        title_fontsize=9.0,
         filter_name=filter_name,
-        output_path=plots / "residuals_by_target.png",
+        output_path=target_residual_path,
         **target_plot_kwargs,
     )
+    legacy_target_residual_plot = plots / "residuals_by_target.png"
+    if legacy_target_residual_plot.is_file():
+        legacy_target_residual_plot.unlink()
     passbands = np.load(run_dir / "posterior_passbands.npz")
+    passband_instruments = passbands["instrument_names"].astype(str)
+    index_mappings = json.loads((run_dir / "index_mappings.json").read_text())
+    instrument_atmospheres, mean_atmosphere = _stored_effective_atmospheres(
+        curves,
+        passband_instruments,
+        index_mappings,
+        1.3,
+    )
     plot_passband_ensemble(
         passbands["wavelength_angstrom"],
         passbands["median"],
-        passbands["instrument_names"].astype(str),
+        passband_instruments,
         nominal=curves["nominal_combined_passband"],
+        instrument_atmospheric_transmission=instrument_atmospheres,
+        nominal_atmospheric_transmission=mean_atmosphere,
+        atmospheric_airmass=1.3,
         title=(
             f"{filter_name} passbands — model: "
             f"{passband_model_label(run_config.model.passband_mode)}"
@@ -366,6 +450,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if args.config is None or args.filter is None:
                     parser.error("new fits require --config and --filter")
                 config = load_config(args.config, selected_filter=args.filter)
+            if args.seed is not None:
+                if not 0 <= args.seed < 2**32:
+                    parser.error("--seed must be between 0 and 2**32-1")
+                config = replace(config, sampler=replace(config.sampler, random_seed=args.seed))
             override = None
             if args.smoke:
                 prepared = prepare_fit(config)
