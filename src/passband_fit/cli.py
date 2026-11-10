@@ -190,6 +190,7 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--config", type=Path)
     fit.add_argument("--filter")
     fit.add_argument("--run-label")
+    fit.add_argument("--run-subdirectory", help="Optional folder below runs/<filter>, e.g. wrong_I")
     fit.add_argument("--seed", type=int, help="Override sampler.random_seed in the saved run configuration")
     fit.add_argument(
         "--resume",
@@ -251,6 +252,8 @@ def _smoke_settings(config: object, ndim: int) -> NumpyroSettings:
 
 
 def _regenerate_plots(run_dir: Path) -> None:
+    from .camera_forest import generate_camera_forest
+    generate_camera_forest(run_dir)
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"missing manifest: {manifest_path}")
@@ -464,6 +467,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 run_label=args.run_label,
                 resume_directory=args.resume,
                 sampler_override=override,
+                run_subdirectory=args.run_subdirectory,
             )
             print(run_dir)
             return 0

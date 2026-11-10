@@ -162,6 +162,10 @@ for reproducibility; use the production leak configs above for the current
 red-only definitions.
 
 On koa, `python run_all.py` submits the configured variants, including the
+four long-pass `I`, `I_0`, `I_2`, and `I_3` configurations under
+`runs/I/wrong_I/`; the `Ic*` configurations remain directly under `runs/I/`.
+The launcher uses `--run-subdirectory wrong_I` to select that extra folder.
+It also submits the
 four leak fits, using the project `.cluster-venv` environment. It preserves existing run
 outputs and the project observation file. Each job has a separate script in
 `batch_jobs/`. If a requested run directory already exists, the fitter creates
@@ -272,6 +276,18 @@ This writes `runs/mean_zeropoints_all_runs.png` and a matching CSV summary. The
 plot uses Vega=0 zeropoints for U/B/V/R/I and AB zeropoints for up/gp/rp/ip/zp;
 the internal `zs` run directory is displayed as `zp` in this cross-run figure.
 
+To compare the inferred instrument-population zeropoint dispersion by band:
+
+```bash
+PYTHONPATH=src /opt/anaconda3/bin/python plot_zeropoint_population_dispersion.py
+```
+
+This writes `runs/zeropoint_population_dispersion_by_band.png`, a PDF, and a
+CSV. It uses the exact run inventory from `mean_zeropoints_all_runs.csv` and
+summarizes `tau_Z = exp(log_tau_Z)` from each chain, with posterior medians and
+16th--84th percentile intervals in mmag. Selected models are boxed. This is the
+inferred spread of instrument zeropoints within each band.
+
 To compare the source-independent mean effective wavelength of the
 population-level passband across completed runs, use:
 
@@ -327,7 +343,8 @@ intervals for shift, shift + width, and shift + width + warp, using the summary
 figures' model colors. The four right panels show the original residuals from
 the completed fixed run, followed by each variant's saved residuals **before
 star offsets**, with common wavelength limits, independent residual limits,
-and one star legend. Figures are 11.5 by 7.5 inches before tight cropping.
+and one star legend. Each standard uses the same color and symbol across bands.
+Figures are 11.5 by 7.5 inches before tight cropping.
 The passband column takes two-thirds of the panel width, with the residuals
 in the remaining third.
 The left column has a main throughput panel starting at zero and a lower
@@ -423,7 +440,11 @@ hierarchical calibration model, run:
 This writes PNG and vector PDF versions under `figures/`. The diagram includes
 the camera and standard-star plates, passband-shape and zeropoint hierarchies,
 the analytically marginalized star offset, and the synthetic-photometry and
-observation dependencies.
+observation dependencies. It covers all five NumPyro passband modes, including
+the logit-normal leak-scale hierarchy, and distinguishes quoted measurement
+errors from observed magnitudes. The figure omits the title and footer
+annotations for use in a manuscript; warp and leak are alternative shape
+families.
 
 To make a LaTeX site-by-standard observing grid from a photometry table, run:
 
@@ -433,10 +454,15 @@ PYTHONPATH=src /opt/anaconda3/bin/python make_observation_grid.py \
   --output observed_photometry_site_grid.tex
 ```
 
-Rows are sorted by synthetic B-V. Each site column lists the filters in which
-that standard was observed. The sorting color uses the nominal combined B and V
-responses (filter, aluminum, CCD QE, and the mean configured unit-airmass site atmosphere) in the
-Vega-zero convention. Filter names and numerical values are printed in math
+Rows are sorted north to south by the standard's J2000 declination, and site
+columns are sorted north to south by geographic latitude. Two header lines give
+the observatory name and then its code. Coordinates are cached locally in
+`standard_declinations.json` from the STScI CALSPEC coordinate table; pass
+`--standard-declinations` to use another mapping (decimal degrees or signed
+degrees/minutes/seconds). Site names and latitudes come from LCO's site list in
+`make_observation_grid.py`; unknown stars or sites produce a clear error.
+Each site column lists the filters in which that standard was observed.
+Filter names and numerical values are printed in math
 mode, with `up`/`gp`/`rp`/`ip` rendered as $u^\prime$/$g^\prime$/$r^\prime$/$i^\prime$
 and the internal `zs` label rendered as $z_s$. Filter labels outside the requested
 list are ignored with a warning. Use `--help` to override the B/V configurations,
@@ -508,6 +534,47 @@ ranking of all candidate templates. Inspect these diagnostics before changing
 ## Outputs
 
 Each run stores the resolved configuration and input hashes, selection and index mappings, nominal component and combined curves, the authoritative NumPyro chain in `chain.npz`, flattened samples, parameter summaries and correlations, nominal and fitted synthetic magnitudes and residuals, posterior passband products, posterior-predictive summaries, plots, and a machine-readable manifest. The physical summaries include `sigma_star` and conditionally reconstructed `star_offset[target]` values, and `plots/forest_star_offset.png` shows their intervals. `nominal_curves.csv` contains every relevant site atmosphere plus a compatibility column holding their equally instrument-weighted mean. `zeropoint_conventions.json` records each instrument's nominal unit-airmass AB-minus-Vega conversion and uses their equal-weight mean for the population-mean zeropoint label; every likelihood integral uses the exact observation's site and airmass. The internal magnitude bookkeeping constant is not included. `diagnostics.json` and `diagnostics_by_parameter.csv` save R-hat, effective sample size, acceptance probabilities, divergences, tree-depth information, and the effective chain execution method. `boundary_diagnostics.json` reports posterior proximity to numerical shift/width/warp limits and the wavelength-grid endpoints.
+
+`plots/forest_camera_parameters.pdf` (also PNG) aligns one camera per row and one
+physical parameter per column: zeropoint, wavelength shift, width factor, and
+warp coefficient or leak scale, as applicable. Dots and bars show the fully
+marginalized median and central 68% interval from the saved physical summary.
+The gray vertical band shows the population range at posterior-median
+hyperparameters: median(mu) +/- median(tau), with a dashed line at median(mu).
+For width, those three values are exponentiated from log-width; for leak they
+are transformed from logit to leak scale. This band is the inferred population
+spread, not a credible interval on its mean. Its bounds and hyperparameter
+medians are included in the plotted CSV alongside camera quantiles;
+fixed passbands have only a zeropoint column. Zeropoints retain the configured
+magnitude system shown on the axis. The exact plotted quantiles are also saved
+as `plots/forest_camera_parameters.csv`. These products are generated by new
+fits and `passband-fit plot --run RUN_DIRECTORY`. To regenerate just these
+forests for every completed run, including duplicates and `wrong_I`, use
+`PYTHONPATH=src python plot_camera_forests.py`; add `--run RUN_DIRECTORY` for one
+run or `--runs-dir OTHER_RUNS_DIRECTORY` for another tree. This reads saved
+summary tables and does not rerun MCMC.
+
+For `shift_width` runs, the figure instead keeps the zeropoint forest on the
+left and overlays all cameras' joint shift-versus-width posteriors on the
+right. Colors identify cameras; solid contours enclose approximately
+68% of each joint posterior, using a smoothed 2D histogram of all saved
+paired draws. Width is exponentiated for each draw, retaining its correlation
+with shift. This layout reads the chain as well as the summary tables.
+Use `--mode shift_width` to regenerate only these figures.
+For `shift_width_warp` and `shift_width_leak`, the same zeropoint forest is
+followed by three joint-posterior panels in one row: shift/width, shift/warp
+(or leak), and width/warp (or leak). Each camera keeps the same color across
+all three panels. The warp coefficient is plotted directly; leak scale is
+transformed from logit on every saved draw. Regenerate these with
+`PYTHONPATH=src python plot_camera_forests.py --mode shift_width_warp shift_width_leak`.
+Each joint panel also shows a filled gray 68% population region beneath the
+camera contours. This uses independent Gaussian population coordinates with
+mu and tau fixed to their marginal posterior medians. The joint 68% ellipse
+has radius sqrt(-2 log(1-0.68)) in standardized latent coordinates and is
+mapped to physical width/leak axes using exp/expit. It shows the population
+spread, rather than posterior uncertainty in the hyperparameter means; after
+nonlinear mapping it remains a 68% region, not necessarily a highest-density
+region in physical coordinates.
 
 Target-residual plots include the filter and readable passband model in their
 filenames, for example `residuals_by_target_V_shift.png` and

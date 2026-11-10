@@ -737,18 +737,20 @@ def _safe_label(value: str) -> str:
     return result
 
 
-def create_run_directory(config: FitConfig, run_label: Optional[str] = None) -> Path:
+def create_run_directory(config: FitConfig, run_label: Optional[str] = None,
+                         run_subdirectory: Optional[str] = None) -> Path:
     """Reserve a fresh output directory, adding a numeric suffix on collisions."""
     label = (
         run_label
         or config.output.run_label
         or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     )
-    destination = (
-        config.output.directory
-        / _safe_label(str(config.selected_filter))
-        / _safe_label(label)
-    )
+    parent = config.output.directory / _safe_label(str(config.selected_filter))
+    if run_subdirectory is not None:
+        if run_subdirectory in {"", ".", ".."} or _safe_label(run_subdirectory) != run_subdirectory:
+            raise ValueError("run_subdirectory must be a single safe directory name")
+        parent = parent / run_subdirectory
+    destination = parent / _safe_label(label)
     return reserve_run_directory(destination)
 
 
@@ -1093,6 +1095,8 @@ def _write_products(
     )
     write_json(run_dir / "boundary_diagnostics.json", boundary_diagnostics)
 
+    from .camera_forest import generate_camera_forest
+    generate_camera_forest(run_dir)
     plots = run_dir / "plots"
     plot_trace(result.chain, layout.parameter_names, plots / "trace.png")
     plot_log_probability_trace(result.log_probability, plots / "log_probability.png")
@@ -1413,6 +1417,7 @@ def run_fit(
     run_label: Optional[str] = None,
     resume_directory: Optional[Path] = None,
     sampler_override: Optional[NumpyroSettings] = None,
+    run_subdirectory: Optional[str] = None,
 ) -> Path:
     """Prepare, sample with NumPyro NUTS, and persist one complete filter run."""
 
@@ -1448,7 +1453,7 @@ def run_fit(
     config = prepared.config
     layout, posterior = build_posterior(prepared)
     run_kind = "smoke" if sampler_override is not None else "production"
-    run_dir = create_run_directory(config, run_label)
+    run_dir = create_run_directory(config, run_label, run_subdirectory)
     print(f"Run output directory: {run_dir}", flush=True)
     write_resolved_config(run_dir / "resolved_config.yaml", config)
     write_json(run_dir / "selection_summary.json", prepared.selected.summary)
